@@ -115,6 +115,37 @@ Example 2 — a long-read contig assembly:
 In both cases the contigs were ordered into one scaffold per reference
 chromosome; complete BUSCOs are preserved or improved after scaffolding.
 
+## Comparison with RagTag
+
+The same two assemblies were also scaffolded with RagTag against the same
+reference. BUSCO was run with embryophyta_odb10 (n=1614, euk_genome_min
+mode) under two scopes: "chromosome scaffolds" counts only the 14
+chromosome-level scaffolds; "full output" counts every sequence in the
+tool's output file (both tools append unplaced contigs by default).
+
+Example 1 — a highly fragmented assembly:
+
+| metric | RagTag | nearscaff |
+|---|---|---|
+| anchoring rate (by bases) | 58.4% | **76.9%** |
+| scaffold N50 | 19 Mb | **31 Mb** |
+| BUSCO — chromosome scaffolds | **C:86.6%** [S:85.2%, D:1.4%], F:4.8%, M:8.6% | C:85.0% [S:82.9%, D:2.1%], F:10.5%, M:4.5% |
+| BUSCO — full output | C:93.0% [S:90.8%, D:2.2%], F:5.5%, M:1.5% | C:86.6% [S:84.0%, D:2.5%], F:10.2%, M:3.2% |
+
+Example 2 — a long-read contig assembly:
+
+| metric | RagTag | nearscaff |
+|---|---|---|
+| anchoring rate (by bases) | 87.2% | **96.0%** |
+| scaffold N50 | 27 Mb | **32 Mb** |
+| BUSCO — chromosome scaffolds | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:97.4%** [S:95.4%, D:2.0%], F:1.9%, M:0.7% |
+| BUSCO — full output | C:97.8% [S:95.5%, D:2.4%], F:2.0%, M:0.2% | C:97.8% [S:95.5%, D:2.2%], F:2.0%, M:0.2% |
+
+Note: in Example 1 RagTag's full-output BUSCO (93.0%) is markedly higher
+than its own chromosome scaffolds (86.6%); this discrepancy is still under
+investigation, so the chromosome-scaffold scope is the recommended basis
+for comparison.
+
 ## Development
 
 Run the test suite (integration tests are skipped automatically when
