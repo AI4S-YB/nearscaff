@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nearscaff"
+version = "0.1.0"
+description = "Reference-guided genome scaffolding: anchor contigs to a closely related reference via proteins and nucleotide synteny"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "networkx>=2.6",
+]
+
+[project.scripts]
+nearscaff = "nearscaff.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["nearscaff*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests requiring external tools (miniprot, minimap2, samtools)",
+    "slow: slow end-to-end tests",
+]

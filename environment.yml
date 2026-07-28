@@ -1,0 +1,14 @@
+name: nearscaff
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python>=3.10,<3.13
+  - networkx>=3
+  - minimap2>=2.24
+  - miniprot>=0.13
+  - samtools>=1.15
+  - pip
+  - pip:
+      - .
