@@ -99,18 +99,18 @@ Example 1 — a highly fragmented assembly:
 | | before | after |
 |---|---|---|
 | sequences | 551,915 contigs | 14 chromosome-level scaffolds |
-| total size | 564.0 Mb | 431.8 Mb anchored (76.6%) |
-| N50 | 0.019 Mb | 30.8 Mb (scaffolds) |
-| BUSCO (embryophyta_odb10) | C:83.0% [S:80.7%, D:2.3%], F:13.3%, M:3.8% | C:85.0% [S:82.9%, D:2.1%], F:10.5%, M:4.5% |
+| total size | 564.0 Mb | 430.9 Mb anchored (76.4%) |
+| N50 | 0.019 Mb | 33.7 Mb (scaffolds) |
+| BUSCO (embryophyta_odb10) | C:83.0% [S:80.7%, D:2.3%], F:13.3%, M:3.8% | C:88.3% [S:86.1%, D:2.2%], F:8.9%, M:2.9% |
 
 Example 2 — a long-read contig assembly:
 
 | | before | after |
 |---|---|---|
 | sequences | 17,594 contigs | 14 chromosome-level scaffolds |
-| total size | 456.0 Mb | 437.7 Mb anchored (96.0%) |
-| N50 | 2.95 Mb | 30.9 Mb (scaffolds) |
-| BUSCO (embryophyta_odb10) | C:97.7% [S:95.4%, D:2.3%], F:2.1%, M:0.2% | C:97.4% [S:95.4%, D:2.0%], F:1.9%, M:0.7% |
+| total size | 456.0 Mb | 440.0 Mb anchored (96.5%) |
+| N50 | 2.95 Mb | 33.3 Mb (scaffolds) |
+| BUSCO (embryophyta_odb10) | C:97.7% [S:95.4%, D:2.3%], F:2.1%, M:0.2% | C:97.5% [S:95.5%, D:2.0%], F:1.9%, M:0.6% |
 
 In both cases the contigs were ordered into one scaffold per reference
 chromosome; complete BUSCOs are preserved or improved after scaffolding.
@@ -127,19 +127,19 @@ Example 1 — a highly fragmented assembly:
 
 | metric | RagTag | nearscaff |
 |---|---|---|
-| anchoring rate (by bases) | 58.4% | **76.9%** |
-| scaffold N50 | 19 Mb | **31 Mb** |
-| BUSCO — chromosome scaffolds | **C:86.6%** [S:85.2%, D:1.4%], F:4.8%, M:8.6% | C:85.0% [S:82.9%, D:2.1%], F:10.5%, M:4.5% |
-| BUSCO — full output | C:93.0% [S:90.8%, D:2.2%], F:5.5%, M:1.5% | C:86.6% [S:84.0%, D:2.5%], F:10.2%, M:3.2% |
+| anchoring rate (by bases) | 58.4% | **76.4%** |
+| scaffold N50 | 19 Mb | **33.7 Mb** |
+| BUSCO — chromosome scaffolds | C:86.6% [S:85.2%, D:1.4%], F:4.8%, M:8.6% | **C:88.3%** [S:86.1%, D:2.2%], F:8.9%, M:2.9% |
+| BUSCO — full output | C:93.0% [S:90.8%, D:2.2%], F:5.5%, M:1.5% | C:89.7% [S:87.3%, D:2.4%], F:8.6%, M:1.7% |
 
 Example 2 — a long-read contig assembly:
 
 | metric | RagTag | nearscaff |
 |---|---|---|
-| anchoring rate (by bases) | 87.2% | **96.0%** |
-| scaffold N50 | 27 Mb | **32 Mb** |
-| BUSCO — chromosome scaffolds | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:97.4%** [S:95.4%, D:2.0%], F:1.9%, M:0.7% |
-| BUSCO — full output | C:97.8% [S:95.5%, D:2.4%], F:2.0%, M:0.2% | C:97.8% [S:95.5%, D:2.2%], F:2.0%, M:0.2% |
+| anchoring rate (by bases) | 87.2% | **96.5%** |
+| scaffold N50 | 27 Mb | **33.3 Mb** |
+| BUSCO — chromosome scaffolds | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:97.5%** [S:95.5%, D:2.0%], F:1.9%, M:0.6% |
+| BUSCO — full output | C:97.8% [S:95.5%, D:2.4%], F:2.0%, M:0.2% | C:97.8% [S:95.5%, D:2.3%], F:2.0%, M:0.2% |
 
 Note: in Example 1 RagTag's full-output BUSCO (93.0%) is markedly higher
 than its own chromosome scaffolds (86.6%); this discrepancy is still under
