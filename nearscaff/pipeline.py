@@ -21,6 +21,10 @@ from nearscaff.types import EdgeType
 
 logger = logging.getLogger("nearscaff")
 
+# Minimum mapq of the final precise alignment for a contig's orientation
+# to be reported as +/- in the AGP; below this it is reported as '?'.
+MIN_ORIENT_MAPQ = 10
+
 # Pattern: FCYA01G000001.mRNA1 -> chromosome=FCYA01, gene_number=1
 _PROTEIN_ID_PATTERN = re.compile(r'^(\D+\d+)G(\d+)')
 
@@ -484,9 +488,9 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
     # Runs BEFORE AGP extraction: the refined coordinates and strands are
     # used to normalize scaffold direction and orient each AGP component.
     logger.info("Stage 1d: Final precise alignment of all placed contigs ...")
-    contig_strand = _refine_contig_coordinates(contig_ref, contig_lengths,
-                                               ref_fasta, query_fasta,
-                                               config, chunk_threads)
+    contig_strand, contig_mapq = _refine_contig_coordinates(
+        contig_ref, contig_lengths, ref_fasta, query_fasta,
+        config, chunk_threads)
     logger.info("  %d contigs with refined reference coordinates", len(contig_ref))
 
     # ---- Extract final AGP ----
@@ -494,7 +498,8 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
     agp_lines = _extract_agp_paths(cover, contig_lengths,
                                    config.scaffold.unknown_gap_size,
                                    contig_ref=contig_ref,
-                                   contig_strand=contig_strand)
+                                   contig_strand=contig_strand,
+                                   contig_mapq=contig_mapq)
 
     agp_path = os.path.join(output_dir, "nearscaff.agp")
     writer = AGPWriter()
@@ -984,15 +989,16 @@ def _refine_contig_coordinates(contig_ref: dict, contig_lengths: dict,
     step runs a minimap2 alignment of all placed contigs against the full
     reference genome and updates *contig_ref* with real genomic coordinates.
 
-    Returns {contig: '+'/'-'} strand map from the alignment (empty dict on
-    failure) — used to orient AGP components.
+    Returns (strand_map, mapq_map) — {contig: '+'/'-'} and {contig: mapq}
+    from the best alignment per contig (empty dicts on failure); used to
+    orient AGP components.
     """
     import tempfile, os, subprocess
     from nearscaff.nucleotide import parse_nucleotide_paf, _extract_contigs
 
     placed_contigs = list(contig_ref.keys())
     if not placed_contigs:
-        return {}
+        return {}, {}
 
     # Write placed contigs to temp FASTA
     fd, placed_fa = tempfile.mkstemp(suffix='.fa')
@@ -1006,7 +1012,7 @@ def _refine_contig_coordinates(contig_ref: dict, contig_lengths: dict,
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             logger.warning("Final precise alignment failed: %s", result.stderr)
-            return {}
+            return {}, {}
 
         entries = parse_nucleotide_paf(result.stdout)
         logger.info("  %d alignments from final precise pass", len(entries))
@@ -1026,6 +1032,7 @@ def _refine_contig_coordinates(contig_ref: dict, contig_lengths: dict,
                 best[query] = (key, entry)
 
         contig_strand = {}
+        contig_mapq = {}
         updated = 0
         for query, (_key, entry) in best.items():
             paf_chr = entry['ref_chr'].split(':')[0]
@@ -1037,10 +1044,11 @@ def _refine_contig_coordinates(contig_ref: dict, contig_lengths: dict,
             if paf_chr and len(paf_chr) > 2:
                 contig_ref[query] = (paf_chr, rs, re)
                 contig_strand[query] = entry['strand']
+                contig_mapq[query] = entry['mapq']
                 updated += 1
 
         logger.info("  %d contig coordinates refined", updated)
-        return contig_strand
+        return contig_strand, contig_mapq
     finally:
         if os.path.exists(placed_fa):
             os.unlink(placed_fa)
@@ -1387,7 +1395,8 @@ def _extract_agp_paths(cover, contig_lengths: dict,
                        gap_min: int = 0,
                        gap_max: int = 500000,
                        contig_ref: dict | None = None,
-                       contig_strand: dict | None = None):
+                       contig_strand: dict | None = None,
+                       contig_mapq: dict | None = None):
     """Extract linear scaffold paths from cover graph into AGP lines.
 
     Each connected component in *cover* is a path (cycles already broken).
@@ -1395,20 +1404,21 @@ def _extract_agp_paths(cover, contig_lengths: dict,
     between them.  Isolated nodes (degree-0, unplaced contigs) become
     their own single-contig scaffolds.
 
-    Orientation: the traversal direction of a path is arbitrary, so
-    strands inferred from traversal alone are meaningless in absolute
-    terms.  When *contig_ref* (refined reference coordinates) and
-    *contig_strand* (strands from the final precise alignment) are given,
-    each scaffold is normalized to increasing reference coordinates and
-    each component is oriented by its alignment strand.  Contigs without
-    alignment evidence keep the traversal-inferred strand, flipped
-    together with the rest of the scaffold.
+    When *contig_ref* (refined reference coordinates) is given, scaffold
+    components are re-ordered by reference midpoint — contigs without
+    coordinates keep their graph order, interpolated between anchored
+    neighbours.  When *contig_strand* (strands from the final precise
+    alignment) is given, components are oriented by their alignment
+    strand; strands with mapq below MIN_ORIENT_MAPQ (from *contig_mapq*)
+    are reported as '?'.  Contigs without alignment evidence keep the
+    traversal-inferred strand.
     """
     from nearscaff.agp import AGPSeqLine, AGPGapLine
     import networkx as nx
 
     contig_ref = contig_ref or {}
     contig_strand = contig_strand or {}
+    contig_mapq = contig_mapq or {}
 
     lines = []
     scaffold_idx = 1
@@ -1449,18 +1459,31 @@ def _extract_agp_paths(cover, contig_lengths: dict,
             if base not in seen_bases:
                 seen_bases.append(base)
 
-        # Normalize scaffold direction to the reference: flip the whole
-        # path if reference coordinates decrease along it.
-        flip = False
-        mids = [(i, (contig_ref[b][1] + contig_ref[b][2]) / 2)
-                for i, b in enumerate(seen_bases) if b in contig_ref]
+        # Order by refined reference midpoint.  Contigs without coordinates
+        # keep graph order, interpolated between anchored neighbours so the
+        # scaffold runs in increasing reference coordinates.
+        mids = {b: (contig_ref[b][1] + contig_ref[b][2]) / 2
+                for b in seen_bases if b in contig_ref}
         if len(mids) >= 2:
-            half = max(1, len(mids) // 2)
-            first_mean = sum(m for _, m in mids[:half]) / len(mids[:half])
-            last_mean = sum(m for _, m in mids[-half:]) / len(mids[-half:])
-            flip = last_mean < first_mean
-        if flip:
-            seen_bases = seen_bases[::-1]
+            anchored_idx = [i for i, b in enumerate(seen_bases) if b in mids]
+            est = []
+            for i, b in enumerate(seen_bases):
+                if b in mids:
+                    est.append(mids[b])
+                    continue
+                lo = max((j for j in anchored_idx if j < i), default=None)
+                hi = min((j for j in anchored_idx if j > i), default=None)
+                if lo is not None and hi is not None:
+                    m = (mids[seen_bases[lo]] + mids[seen_bases[hi]]) / 2
+                elif lo is not None:
+                    m = mids[seen_bases[lo]] - 0.5
+                else:
+                    m = mids[seen_bases[hi]] + 0.5
+                est.append(m)
+            # stable sort: ties (and interpolations) keep graph order
+            seen_bases = [b for _, b in sorted(zip(est, seen_bases),
+                                               key=lambda t: t[0])]
+        flip = False
 
         scaf_name = f"nearscaff_{scaffold_idx:04d}"
         pos = 1
@@ -1470,20 +1493,21 @@ def _extract_agp_paths(cover, contig_lengths: dict,
             ctg_len = contig_lengths.get(base, 1000)
 
             if base in contig_strand:
-                # Orientation from the final precise alignment
-                strand = contig_strand[base]
+                # Orientation from the final precise alignment; mark
+                # low-mapping-quality evidence as unknown.
+                if contig_mapq.get(base, 60) < MIN_ORIENT_MAPQ:
+                    strand = "?"
+                else:
+                    strand = contig_strand[base]
             else:
                 # Fallback: infer strand from the path traversal
-                # (if we see _b first, it's +; if _e first, it's -),
-                # flipped together with the scaffold.
+                # (if we see _b first, it's +; if _e first, it's -).
                 first_occurrence = None
                 for n in path:
                     if n[:-2] == base:
                         first_occurrence = n
                         break
                 strand = "-" if first_occurrence and first_occurrence.endswith("_e") else "+"
-                if flip:
-                    strand = "+" if strand == "-" else "-"
 
             lines.append(AGPSeqLine(
                 scaf_name, pos, pos + ctg_len - 1, part_num,

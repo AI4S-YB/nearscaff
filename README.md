@@ -22,9 +22,12 @@ chromosome-level scaffolds.
   with constrained minimap2 nucleotide alignments (`asm5` → `asm10` →
   `asm20` passes) that pull unplaced contigs into scaffolds. A
   maximum-weight matching (Edmonds' Blossom for small graphs, a greedy
-  heuristic above 20 000 edges) resolves the final contig order.
-  Scaffolds are merged per chromosome and written as AGP, then converted
-  to FASTA.
+  heuristic above 20 000 edges) resolves contig adjacency. Scaffolds are
+  merged per chromosome, all placed contigs are re-aligned against the
+  reference in a final precise pass, and components are ordered by
+  reference midpoint and oriented by alignment strand (orientations
+  supported only by low-mapping-quality alignments are reported as `?`).
+  Scaffolds are written as AGP, then converted to FASTA.
 
 ## Requirements
 
@@ -99,18 +102,18 @@ Example 1 — a highly fragmented assembly:
 | | before | after |
 |---|---|---|
 | sequences | 551,915 contigs | 14 chromosome-level scaffolds |
-| total size | 564.0 Mb | 430.9 Mb anchored (76.4%) |
-| N50 | 0.019 Mb | 33.7 Mb (scaffolds) |
-| BUSCO (embryophyta_odb10) | C:83.0% [S:80.7%, D:2.3%], F:13.3%, M:3.8% | C:88.3% [S:86.1%, D:2.2%], F:8.9%, M:2.9% |
+| total size | 564.0 Mb | 431.7 Mb anchored (76.5%) |
+| N50 | 0.019 Mb | 32.2 Mb (scaffolds) |
+| BUSCO (embryophyta_odb10) | C:83.0% [S:80.7%, D:2.3%], F:13.3%, M:3.8% | C:92.1% [S:90.1%, D:2.0%], F:5.4%, M:2.5% |
 
 Example 2 — a long-read contig assembly:
 
 | | before | after |
 |---|---|---|
 | sequences | 17,594 contigs | 14 chromosome-level scaffolds |
-| total size | 456.0 Mb | 440.0 Mb anchored (96.5%) |
-| N50 | 2.95 Mb | 33.3 Mb (scaffolds) |
-| BUSCO (embryophyta_odb10) | C:97.7% [S:95.4%, D:2.3%], F:2.1%, M:0.2% | C:97.5% [S:95.5%, D:2.0%], F:1.9%, M:0.6% |
+| total size | 456.0 Mb | 437.4 Mb anchored (95.9%) |
+| N50 | 2.95 Mb | 32.6 Mb (scaffolds) |
+| BUSCO (embryophyta_odb10) | C:97.7% [S:95.4%, D:2.3%], F:2.1%, M:0.2% | C:97.6% [S:95.5%, D:2.0%], F:1.7%, M:0.7% |
 
 In both cases the contigs were ordered into one scaffold per reference
 chromosome; complete BUSCOs are preserved or improved after scaffolding.
@@ -119,32 +122,51 @@ chromosome; complete BUSCOs are preserved or improved after scaffolding.
 
 The same two assemblies were also scaffolded with RagTag against the same
 reference. BUSCO was run with embryophyta_odb10 (n=1614, euk_genome_min
-mode) under two scopes: "chromosome scaffolds" counts only the 14
-chromosome-level scaffolds; "full output" counts every sequence in the
-tool's output file (both tools append unplaced contigs by default).
+mode) on the 14 chromosome-level scaffolds only (unplaced contigs are not
+counted).
 
 Example 1 — a highly fragmented assembly:
 
 | metric | RagTag | nearscaff |
 |---|---|---|
-| anchoring rate (by bases) | 58.4% | **76.4%** |
-| scaffold N50 | 19 Mb | **33.7 Mb** |
-| BUSCO — chromosome scaffolds | C:86.6% [S:85.2%, D:1.4%], F:4.8%, M:8.6% | **C:88.3%** [S:86.1%, D:2.2%], F:8.9%, M:2.9% |
-| BUSCO — full output | C:93.0% [S:90.8%, D:2.2%], F:5.5%, M:1.5% | C:89.7% [S:87.3%, D:2.4%], F:8.6%, M:1.7% |
+| anchoring rate (by bases) | 58.4% | **76.5%** |
+| scaffold N50 | 19 Mb | **32.2 Mb** |
+| BUSCO — chromosome scaffolds | C:86.6% [S:85.2%, D:1.4%], F:4.8%, M:8.6% | **C:92.1%** [S:90.1%, D:2.0%], F:5.4%, M:2.5% |
 
 Example 2 — a long-read contig assembly:
 
 | metric | RagTag | nearscaff |
 |---|---|---|
-| anchoring rate (by bases) | 87.2% | **96.5%** |
-| scaffold N50 | 27 Mb | **33.3 Mb** |
-| BUSCO — chromosome scaffolds | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:97.5%** [S:95.5%, D:2.0%], F:1.9%, M:0.6% |
-| BUSCO — full output | C:97.8% [S:95.5%, D:2.4%], F:2.0%, M:0.2% | C:97.8% [S:95.5%, D:2.3%], F:2.0%, M:0.2% |
+| anchoring rate (by bases) | 87.2% | **95.9%** |
+| scaffold N50 | 27 Mb | **32.6 Mb** |
+| BUSCO — chromosome scaffolds | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:97.6%** [S:95.5%, D:2.0%], F:1.7%, M:0.7% |
 
-Note: in Example 1 RagTag's full-output BUSCO (93.0%) is markedly higher
-than its own chromosome scaffolds (86.6%); this discrepancy is still under
-investigation, so the chromosome-scaffold scope is the recommended basis
-for comparison.
+Note: RagTag leaves many gene-bearing contigs unplaced (its chromosome
+scaffolds miss 8.6% of BUSCOs in Example 1); nearscaff's nucleotide
+extension passes recover most of those contigs onto chromosomes.
+
+### Placement accuracy
+
+Placement correctness was measured against an independent truth set: each
+query contig's best primary minimap2 alignment to the reference (kept only
+when mapq ≥ 30 and alignment covers ≥ 50% of the contig). Metrics are
+chromosome concordance, orientation concordance (among chr-concordant
+contigs), and within-scaffold order concordance (adjacent-pair
+monotonicity of truth coordinates).
+
+| metric | RagTag | nearscaff |
+|---|---|---|
+| Example 1 — chr concordance | 99.86% | 98.83% |
+| Example 1 — orientation | 99.92% | 93.73% |
+| Example 1 — order | 99.80% | 85.63% |
+| Example 2 — chr concordance | 97.35% | 89.96% |
+| Example 2 — orientation | 99.74% | 96.62% |
+| Example 2 — order | 99.05% | 91.30% |
+
+nearscaff places far more contigs than RagTag (Example 1: 86.0k vs 44.7k;
+Example 2: 13.0k vs 5.0k); the extra placements come from the progressive
+`asm5`–`asm20` extension passes, which trade a few points of concordance
+for substantially higher anchoring rates and BUSCO completeness.
 
 ## Development
 
