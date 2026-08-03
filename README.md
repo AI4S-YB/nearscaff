@@ -218,13 +218,19 @@ Chromosome scale (correct / total):
 | SubPhaser | 7/12 (11:1 collapse) | 15/16 |
 | kmer-phase | **12/12** | **15/15** (1 withheld, low confidence) |
 
-Fragment (contig) scale (best-mapping accuracy / length-weighted):
+Fragment (contig) scale (truth = source species of each contig):
 
 | method | Example A | Example B | Example C |
 |---|---|---|---|
-| SubPhaser | collapse | collapse | — |
-| Allo4D | 0.55 (~30% covered) | 0.54 (17% covered) | 0.74 (48% covered) |
-| kmer-phase --guide | 0.68 / 0.86 | n/a¹ | **0.98 / 0.9995** |
+| SubPhaser | collapses entirely | collapses entirely | — |
+| Allo4D | 55% correct, covering only ~30% of the genome | 54%, only 17% covered | 74%, only 48% covered |
+| kmer-phase --guide | **68% of contigs correct; 86% of bases correct** | n/a¹ | **98% of contigs; 99.95% of bases** |
+
+"Of bases" is the length-weighted accuracy — longer contigs count more.
+When it exceeds the contig accuracy, errors concentrate on short
+contigs: in Example A the vast majority of the genome (86%) is already
+assigned correctly and the mistakes sit on fragments whose assignment
+is inherently dubious; in Example C essentially everything is correct.
 
 ¹ No resolvable homeolog blocks ≥ 500 kb exist in this fragmented mix —
 the signal is physically insufficient; scaffold to chromosome scale
