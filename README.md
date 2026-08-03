@@ -5,7 +5,8 @@
 Reference-guided genome scaffolding. `nearscaff` anchors a contig-level
 query assembly onto a closely related reference genome using reference
 proteins and nucleotide synteny, then orders and orients the contigs into
-chromosome-level scaffolds.
+chromosome-level scaffolds.  An optional standalone subgenome phasing
+module (`kmer-phase`) is included (see below).
 
 ## How it works
 
@@ -167,6 +168,72 @@ nearscaff places far more contigs than RagTag (Example 1: 86.0k vs 44.7k;
 Example 2: 13.0k vs 5.0k); the extra placements come from the progressive
 `asm5`–`asm20` extension passes, which trade a few points of concordance
 for substantially higher anchoring rates and BUSCO completeness.
+
+## Subgenome phasing (kmer-phase)
+
+`nearscaff kmer-phase` is a standalone subgenome phasing module (not run
+by the default `run` pipeline), with two modes:
+
+**1. Chromosome-scale phasing.** For chromosome-level
+allopolyploid/mixed assemblies, ideally with a homology file (one
+homeologous chromosome pair per line).  The core is HG-aware orientation
+clustering: a k-mer's enrichment direction must agree across most
+homology pairs to be used; global pair orientations are estimated
+spectrally, per-contig confidence comes from bootstrap, homeologous
+pairs are forcibly split, and weak members are honestly withheld.
+
+```bash
+nearscaff kmer-phase -q assembly.fa -c homology.cfg -o phasing.tsv -t 16
+```
+
+**2. Fragment-level phasing (block-guided).** For contig-level
+polyploid/mixed assemblies with a diploid relative (genome + proteins).
+Fully automatic chain: miniprot annotation -> jcvi collinear homeolog
+blocks -> block-level orientation clustering (near-perfect labels on
+long contigs) -> EM LLR refinement, propagating the signal to short
+contigs that carry no signal of their own.
+
+```bash
+nearscaff kmer-phase -q mixed.fa \
+    --guide diploid.pep --guide-ref diploid.genome.fa \
+    -o phasing.tsv --outdir guide_work -t 16
+```
+
+Dependencies: jellyfish, numpy/scipy/sklearn (clustering); the guided
+mode additionally needs miniprot, gffread and jcvi (with LAST;
+`NEARSCAFF_JCVI` overrides the catalog command prefix, other tools via
+`NEARSCAFF_<TOOL>`).
+
+### Phasing accuracy benchmarks
+
+Three anonymized evaluation sets (pseudo-allotetraploids, truth = the
+source species of each contig/chromosome): Example A — closely related
+pair (fragmented), Example B — moderately diverged pair (fragmented),
+Example C — third-generation long-read pair.
+
+Chromosome scale (correct / total):
+
+| method | Example A (12 chr) | Example B (16 chr) |
+|---|---|---|
+| SubPhaser | 7/12 (11:1 collapse) | 15/16 |
+| kmer-phase | **12/12** | **15/15** (1 withheld, low confidence) |
+
+Fragment (contig) scale (best-mapping accuracy / length-weighted):
+
+| method | Example A | Example B | Example C |
+|---|---|---|---|
+| SubPhaser | collapse | collapse | — |
+| Allo4D | 0.55 (~30% covered) | 0.54 (17% covered) | 0.74 (48% covered) |
+| kmer-phase --guide | 0.68 / 0.86 | n/a¹ | **0.98 / 0.9995** |
+
+¹ No resolvable homeolog blocks ≥ 500 kb exist in this fragmented mix —
+the signal is physically insufficient; scaffold to chromosome scale
+first (Example B then phases at 15/15).
+
+Fragment-scale accuracy is governed by assembly contiguity: the more
+resolvable homeolog blocks ≥ 500 kb, the better the genome-wide result
+(block-level accuracy already reaches 97% at that length).  Low-quality
+output is flagged or withheld rather than reported confidently.
 
 ## Development
 

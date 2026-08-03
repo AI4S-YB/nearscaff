@@ -9,6 +9,10 @@ dependencies:
   - minimap2>=2.24
   - miniprot>=0.13
   - samtools>=1.15
+  - jellyfish>=2.3
+  - numpy
+  - scipy
+  - scikit-learn
   - pip
   - pip:
       - .

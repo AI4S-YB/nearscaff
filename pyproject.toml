@@ -4,12 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nearscaff"
-version = "0.2.0"
+version = "0.3.0"
 description = "Reference-guided genome scaffolding: anchor contigs to a closely related reference via proteins and nucleotide synteny"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "networkx>=2.6",
+]
+
+[project.optional-dependencies]
+# k-mer subgenome phasing (nearscaff kmer-phase)
+phasing = [
+    "numpy",
+    "scipy",
+    "scikit-learn",
 ]
 
 [project.scripts]
