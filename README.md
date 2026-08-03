@@ -172,7 +172,22 @@ for substantially higher anchoring rates and BUSCO completeness.
 ## Subgenome phasing (kmer-phase)
 
 `nearscaff kmer-phase` is a standalone subgenome phasing module (not run
-by the default `run` pipeline), with two modes:
+by the default `run` pipeline), with two modes.
+
+> **Read this first — when NOT to phase**
+>
+> - **Do not phase fragmented assemblies at contig level.** The
+>   subgenome k-mer signal only becomes stable on units of
+>   ≥ ~500 kb–1 Mb.  Handing a fragmented tetraploid (contig N50 of
+>   tens of kb) to any phasing method — SubPhaser, Allo4D, or this one —
+>   yields near-random results.  That is a physical limit of the signal,
+>   not a parameter problem.
+> - The correct route for fragmented assemblies is: **`nearscaff run`
+>   to chromosome scale first, then phase** (mode 1 below).
+> - Mode 1 (chromosome-scale) needs a near-chromosome assembly; mode 2
+>   (fragment-level, `--guide`) needs reasonable contiguity — at least a
+>   handful of homeolog blocks ≥ 500 kb (contig N50 in the hundreds of
+>   kb) — plus a diploid relative (genome + proteins).
 
 **1. Chromosome-scale phasing.** For chromosome-level
 allopolyploid/mixed assemblies, ideally with a homology file (one
