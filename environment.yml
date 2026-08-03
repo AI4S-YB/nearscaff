@@ -9,10 +9,14 @@ dependencies:
   - minimap2>=2.24
   - miniprot>=0.13
   - samtools>=1.15
+  # kmer-phase (subgenome phasing)
   - jellyfish>=2.3
   - numpy
   - scipy
   - scikit-learn
+  # kmer-phase --guide (fragment-level block-guided phasing)
+  - gffread>=0.12
+  - jcvi>=1.4
   - pip
   - pip:
       - .
