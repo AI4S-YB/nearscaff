@@ -163,6 +163,25 @@ class TestPipelineIntegration:
         local_clusters = list(root.iter_level("local"))
         assert len(local_clusters) >= 1, "Should have at least 1 local cluster"
 
+    @pytest.mark.skipif(not HAS_MINIPROT, reason="miniprot not installed")
+    @pytest.mark.skipif(not HAS_MINIMAP2, reason="minimap2 not installed")
+    @pytest.mark.skipif(not HAS_SAMTOOLS, reason="samtools not installed")
+    def test_stage0_writes_alignment_cache(self, tiny_ref_fa, tiny_gff3, tiny_query_fa, tmp_path):
+        """Stage0 should persist per-contig alignments for stage1 refine reuse."""
+        config = NearscaffConfig()
+        config.threads = 2
+        config.synteny.min_cluster_size = 2
+        config.output_dir = str(tmp_path)
+        run_stage0(config, tiny_ref_fa, tiny_gff3, tiny_query_fa, str(tmp_path))
+        cache_path = os.path.join(str(tmp_path), "intermediate", "contig_alignments.tsv")
+        assert os.path.exists(cache_path), "stage0 should write the alignment cache"
+        from nearscaff.nucleotide import read_align_cache
+        cache = read_align_cache(cache_path)
+        assert len(cache) >= 1
+        entry = next(iter(cache.values()))
+        assert set(entry) == {"chr", "r_start", "r_end", "strand",
+                              "mapq", "hitlen", "identity"}
+
     @pytest.mark.skipif(not HAS_MINIMAP2, reason="minimap2 not installed")
     @pytest.mark.skipif(not HAS_SAMTOOLS, reason="samtools not installed")
     def test_stage1_scaffold(self, tiny_ref_fa, tiny_query_fa, tiny_block_tree, tmp_path):
@@ -273,3 +292,74 @@ class TestPipelineIntegration:
         assert result.returncode == 0
         assert "run" in result.stdout
         assert "scaffold" in result.stdout
+
+    @pytest.mark.skipif(not HAS_MINIMAP2, reason="minimap2 not installed")
+    @pytest.mark.skipif(not HAS_SAMTOOLS, reason="samtools not installed")
+    def test_stage1_writes_align_cache(self, tiny_ref_fa, tiny_query_fa, tiny_block_tree, tmp_path):
+        config = NearscaffConfig()
+        config.threads = 2
+        config.nucleotide.region_margin = 1000
+        config.nucleotide.preset = "asm5"
+        config.nucleotide.reuse_ref_index = True
+        config.output_dir = str(tmp_path)
+        agp_path = run_stage1(config, tiny_block_tree, tiny_ref_fa, tiny_query_fa,
+                              str(tmp_path))
+        assert agp_path is not None and os.path.exists(agp_path)
+        cache_path = os.path.join(str(tmp_path), "intermediate", "contig_alignments.tsv")
+        assert os.path.exists(cache_path), f"align cache should exist at {cache_path}"
+
+    @pytest.mark.skipif(not HAS_MINIMAP2, reason="minimap2 not installed")
+    def test_build_ref_index_idempotent(self, tiny_ref_fa, tmp_path):
+        from nearscaff.nucleotide import build_ref_index, index_path_for
+        idx = build_ref_index(tiny_ref_fa, "asm5", str(tmp_path), threads=2)
+        assert os.path.exists(idx)
+        assert idx == index_path_for(tiny_ref_fa, "asm5", str(tmp_path))
+        # idempotent: second call reuses, still succeeds
+        idx2 = build_ref_index(tiny_ref_fa, "asm5", str(tmp_path), threads=2)
+        assert idx == idx2
+
+    @pytest.mark.skipif(not HAS_MINIMAP2, reason="minimap2 not installed")
+    def test_align_to_full_reference_returns_paf(self, tiny_ref_fa, tiny_query_fa, tmp_path):
+        from nearscaff.nucleotide import build_ref_index, align_to_full_reference, parse_nucleotide_paf
+        idx = build_ref_index(tiny_ref_fa, "asm5", str(tmp_path), threads=2)
+        paf = align_to_full_reference(idx, tiny_query_fa, preset="asm5",
+                                      secondary=5, with_cigar=False, threads=2)
+        entries = parse_nucleotide_paf(paf)
+        assert len(entries) >= 1
+        assert all(e["query"] in ("ctg1", "ctg2") for e in entries)
+
+    @pytest.mark.skipif(not HAS_SAMTOOLS, reason="samtools not installed")
+    def test_extract_contigs_faidx_path(self, tmp_path):
+        from nearscaff.nucleotide import ensure_query_faid, _extract_contigs
+        src = tmp_path / "q.fa"
+        src.write_text(">ctg1\nACGTACGT\n>ctg2\nTTTTGGGG\n")
+        qpath = str(src)
+        assert ensure_query_faid(qpath) is True
+        out = str(tmp_path / "out.fa")
+        _extract_contigs(qpath, ["ctg2"], out)
+        txt = open(out).read()
+        assert ">ctg2" in txt and ">ctg1" not in txt
+
+    @pytest.mark.skipif(not HAS_MINIMAP2, reason="minimap2 not installed")
+    @pytest.mark.skipif(not HAS_SAMTOOLS, reason="samtools not installed")
+    def test_align_unplaced_whole_ref_vs_per_region(self, tiny_ref_fa, tiny_query_fa, tmp_path):
+        """Whole-reference path and per-region fallback must find the same queries."""
+        from nearscaff.nucleotide import build_ref_index, ensure_query_faid
+        from nearscaff.pipeline import _align_unplaced_to_scaffolds
+        from types import SimpleNamespace
+        ensure_query_faid(tiny_query_fa)
+        idx = build_ref_index(tiny_ref_fa, "asm5", str(tmp_path), threads=2)
+        region = SimpleNamespace(scaffold_idx=0, ref_chr="Chr1",
+                                 ref_start=5000, ref_end=95000,
+                                 contigs=["ctg1"])
+        unplaced = {"ctg2"}
+        whole = _align_unplaced_to_scaffolds(
+            unplaced, [region], tiny_ref_fa, tiny_query_fa,
+            preset="asm5", margin=1000, threads=2,
+            ref_index=idx, secondary=5)
+        per_region = _align_unplaced_to_scaffolds(
+            unplaced, [region], tiny_ref_fa, tiny_query_fa,
+            preset="asm5", margin=1000, threads=2,
+            ref_index=None, secondary=5)
+        assert {e["query"] for e in whole} == {e["query"] for e in per_region}
+        assert "ctg2" in {e["query"] for e in whole}

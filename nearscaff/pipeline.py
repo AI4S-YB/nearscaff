@@ -33,14 +33,35 @@ _PROTEIN_ID_PATTERN = re.compile(r'^(\D+\d+)G(\d+)')
 # Signal C: Protein anchoring -> synteny -> Block Tree
 # ---------------------------------------------------------------------------
 
+def _best_contig_alignments(entries: list) -> dict:
+    """Best (by nmatch) alignment per contig from parsed PAF entries.
+
+    Returns {contig: (ref_chr, r_start, r_end, identity, strand, mapq, hitlen)}.
+    The trailing strand/mapq/hitlen fields let stage1's refine reuse these
+    alignments instead of realigning the same contigs.
+    """
+    best: dict[str, tuple] = {}
+    for e in entries:
+        query = e['query']
+        paf_chr = e['ref_chr'].split(':')[0]
+        rs = min(e['rstart'], e['rend'])
+        re = max(e['rstart'], e['rend'])
+        nm = e['nmatch']
+        if query not in best or nm > best[query][3]:
+            best[query] = (paf_chr, rs, re, nm, e['hitlen'], e['strand'], e['mapq'])
+    return {k: (v[0], v[1], v[2], v[3] / max(v[4], 1), v[5], v[6], v[4])
+            for k, v in best.items()}
+
+
 def _map_contigs_to_reference(contigs: set, ref_fasta: str, query_fasta: str,
                                threads: int = 4, preset: str = "asm5"
-                               ) -> dict[str, tuple[str, int, int, float]]:
+                               ) -> dict[str, tuple]:
     """Align query contigs to reference genome via minimap2.
 
-    Returns ``{contig_name: (ref_chr, ref_start, ref_end, identity)}``
+    Returns ``{contig: (ref_chr, r_start, r_end, identity, strand, mapq, hitlen)}``
     using the best alignment (by nmatch) per contig.  *identity* is
-    nmatch / hitlen from the minimap2 PAF.
+    nmatch / hitlen from the minimap2 PAF.  The trailing strand/mapq/hitlen
+    fields let stage1's refine reuse these alignments.
     """
     import tempfile
     from nearscaff.nucleotide import _extract_contigs, parse_nucleotide_paf
@@ -61,17 +82,7 @@ def _map_contigs_to_reference(contigs: set, ref_fasta: str, query_fasta: str,
             return {}
 
         entries = parse_nucleotide_paf(result.stdout)
-        best: dict[str, tuple[str, int, int, int, int]] = {}
-        for e in entries:
-            query = e['query']
-            paf_chr = e['ref_chr'].split(':')[0]
-            rs = min(e['rstart'], e['rend'])
-            re = max(e['rstart'], e['rend'])
-            nm = e['nmatch']
-            if query not in best or nm > best[query][3]:
-                best[query] = (paf_chr, rs, re, nm, e['hitlen'])
-        return {k: (v[0], v[1], v[2], v[3] / max(v[4], 1))
-                for k, v in best.items()}
+        return _best_contig_alignments(entries)
     finally:
         if os.path.exists(contigs_fa):
             os.unlink(contigs_fa)
@@ -292,13 +303,31 @@ def _run_signal_c_protein(
     )
     logger.info("  %d contigs with reference alignment", len(contig_ref_pos))
 
+    # Persist per-contig alignments so stage1's refine can reuse them instead
+    # of realigning the same (often large) protein-placed contigs with -c.
+    try:
+        _cache_dir = os.path.join(output_dir, "intermediate")
+        os.makedirs(_cache_dir, exist_ok=True)
+        _cache_path = os.path.join(_cache_dir, "contig_alignments.tsv")
+        _stage0_cache = {
+            ctg: {"chr": t[0], "r_start": t[1], "r_end": t[2],
+                  "strand": t[4], "mapq": t[5], "hitlen": t[6], "identity": t[3]}
+            for ctg, t in contig_ref_pos.items() if len(t) >= 7
+        }
+        from nearscaff.nucleotide import write_align_cache as _write_cache
+        _write_cache(_cache_path, _stage0_cache)
+        logger.info("  Stage0 alignment cache saved (%d contigs) for stage1 reuse",
+                    len(_stage0_cache))
+    except OSError as _e:
+        logger.warning("Could not write stage0 alignment cache (%s); continuing", _e)
+
     # Update anchor coordinates from contig-level alignments.
     # All anchors on the same contig span its full reference alignment
     # so that blocks from different subgenomes mapping to the same
     # reference region will overlap and trigger INTERLEAVED.
     for a in anchors:
         if a.query_contig in contig_ref_pos:
-            crc, crs, cre, _nuc = contig_ref_pos[a.query_contig]
+            crc, crs, cre, _nuc = contig_ref_pos[a.query_contig][:4]
             if a.ref_chr and crc != a.ref_chr:
                 continue  # chromosome mismatch, keep gene-level assignment
             a.ref_chr = crc
@@ -370,6 +399,8 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
     """
     from nearscaff.scaffold_graph import FusedScaffoldGraph
     from nearscaff.agp import AGPWriter
+    from nearscaff.nucleotide import (build_ref_index, ensure_query_faid,
+                                      write_align_cache, read_align_cache)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -402,6 +433,19 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
     for ctg in contig_ref:
         contig_tier[ctg] = "protein"
 
+    # ---- Reusable reference index + query faidx + alignment cache ----
+    index_dir = config.nucleotide.index_dir or os.path.join(output_dir, "intermediate")
+    os.makedirs(index_dir, exist_ok=True)
+    cache_path = os.path.join(index_dir, "contig_alignments.tsv")
+    if config.nucleotide.reuse_ref_index:
+        ensure_query_faid(query_fasta)
+    # Preload per-contig alignments written by stage0 (if present) so refine
+    # reuses them instead of realigning the same protein-placed contigs.
+    align_cache = read_align_cache(cache_path)
+    if align_cache:
+        logger.info("  Preloaded %d contig alignments from stage0 cache",
+                    len(align_cache))
+
     # ---- Pass 1: Build graph with protein edges only ----
     logger.info("Stage 1 — Pass 1 (protein): building scaffold graph ...")
     sg, bt_contigs = _build_initial_graph(root)
@@ -427,23 +471,50 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
             logger.info("  No scaffold regions to extend from")
             break
 
+        # Build/reuse a preset-specific reference index for this pass
+        ref_index = None
+        if config.nucleotide.reuse_ref_index:
+            try:
+                ref_index = build_ref_index(ref_fasta, preset, index_dir,
+                                            threads=config.threads)
+            except RuntimeError as e:
+                logger.warning("Reference index build failed (%s); "
+                               "using per-region alignment", e)
+                ref_index = None
+
         paf_entries = _align_unplaced_to_scaffolds(
             unplaced, scaffold_regions, ref_fasta, query_fasta,
             preset=preset,
             margin=config.nucleotide.region_margin,
             threads=chunk_threads,
+            ref_index=ref_index,
+            secondary=config.nucleotide.secondary_alignments,
         )
         logger.info("  %d PAF entries from alignment", len(paf_entries))
 
-        # Update persistent chromosome lookup from this pass's PAF.
-        # Only ADD new contigs; never overwrite Block Tree assignments.
+        # Update persistent chromosome lookup (add-only) + accumulate
+        # best-per-contig alignment cache for the final refine step.
         for entry in paf_entries:
             query = entry['query']
+            paf_chr = entry['ref_chr'].split(':')[0]
+            rs = min(entry['rstart'], entry['rend'])
+            re = max(entry['rstart'], entry['rend'])
             if query not in contig_ref:
-                paf_chr = entry['ref_chr'].split(':')[0]
-                rs = entry['rstart']
-                re = entry['rend']
-                contig_ref[query] = (paf_chr, min(rs, re), max(rs, re))
+                contig_ref[query] = (paf_chr, rs, re)
+            score = (entry['hitlen'], entry['mapq'])
+            prev = align_cache.get(query)
+            if prev is None or score > (prev['hitlen'], prev['mapq']):
+                # Coordinates/strand come from the extension passes (minimap2
+                # WITHOUT -c); minimap2 reports them regardless of -c, so they
+                # are valid for AGP orientation. Contigs missing from this
+                # cache (mostly protein-placed) get a -c realignment in
+                # _refine_contig_coordinates.
+                align_cache[query] = {
+                    'chr': paf_chr, 'r_start': rs, 'r_end': re,
+                    'strand': entry['strand'], 'mapq': entry['mapq'],
+                    'hitlen': entry['hitlen'],
+                    'identity': entry['nmatch'] / max(entry['hitlen'], 1),
+                }
 
         if not paf_entries:
             logger.info("  No alignments found — skipping remaining passes")
@@ -484,13 +555,32 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
                                           gap_min=config.scaffold.gap_min)
     logger.info("  %d chromosome-level merge edges added to cover", n_merged)
 
+    # Persist the accumulated alignment cache for reuse / inspection
+    try:
+        write_align_cache(cache_path, align_cache)
+        logger.info("  Alignment cache saved to %s (%d contigs)",
+                    cache_path, len(align_cache))
+    except OSError as e:
+        logger.warning("Could not write align cache (%s); continuing", e)
+
+    # Resolve (or rebuild) the index for the final precise preset
+    refine_index = None
+    if config.nucleotide.reuse_ref_index:
+        try:
+            refine_index = build_ref_index(ref_fasta, config.nucleotide.preset,
+                                           index_dir, threads=config.threads)
+        except RuntimeError as e:
+            logger.warning("Reference index build failed for refine (%s)", e)
+            refine_index = None
+
     # ---- Final precise alignment for accurate reference coordinates ----
     # Runs BEFORE AGP extraction: the refined coordinates and strands are
     # used to normalize scaffold direction and orient each AGP component.
-    logger.info("Stage 1d: Final precise alignment of all placed contigs ...")
+    logger.info("Stage 1d: Final precise alignment of placed contigs ...")
     contig_strand, contig_mapq = _refine_contig_coordinates(
         contig_ref, contig_lengths, ref_fasta, query_fasta,
-        config, chunk_threads)
+        config, chunk_threads,
+        ref_index=refine_index, align_cache=align_cache)
     logger.info("  %d contigs with refined reference coordinates", len(contig_ref))
 
     # ---- Extract final AGP ----
@@ -688,25 +778,40 @@ def _get_scaffold_regions(cover, root, contig_lengths: dict) -> list:
 def _align_unplaced_to_scaffolds(unplaced: set, scaffold_regions: list,
                                  ref_fasta: str, query_fasta: str,
                                  preset: str, margin: int,
-                                 threads: int) -> list:
-    """Align unplaced contigs to scaffold reference regions via minimap2.
+                                 threads: int,
+                                 ref_index: str | None = None,
+                                 secondary: int = 5) -> list:
+    """Align unplaced contigs to the reference; return PAF entry list.
 
-    All unplaced contigs are extracted once.  For each scaffold region
-    a constrained alignment is run, and the PAF entries are collected.
+    Prefers ONE whole-reference alignment against *ref_index* (fast: collapses
+    the old per-region × per-pass calls).  Falls back to the per-region
+    constrained path when ref_index is None or the whole-reference run fails.
     """
     import tempfile, os
-    from nearscaff.nucleotide import run_constrained_alignment, _extract_contigs, parse_nucleotide_paf
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from nearscaff.nucleotide import (run_constrained_alignment, _extract_contigs,
+                                       parse_nucleotide_paf, align_to_full_reference)
 
     if not unplaced or not scaffold_regions:
         return []
 
-    # Write unplaced contigs to temp FASTA once
     fd, unplaced_fa = tempfile.mkstemp(suffix='.fa')
     os.close(fd)
     try:
         _extract_contigs(query_fasta, list(unplaced), unplaced_fa)
 
+        # Preferred: a single whole-reference alignment
+        if ref_index is not None:
+            try:
+                paf = align_to_full_reference(ref_index, unplaced_fa, preset,
+                                              secondary=secondary,
+                                              with_cigar=False, threads=threads)
+                return parse_nucleotide_paf(paf)
+            except RuntimeError as e:
+                logger.warning("Whole-reference alignment failed (%s); "
+                               "falling back to per-region", e)
+
+        # Fallback: per-region constrained alignment (prior behavior)
         def _align_one(region):
             return run_constrained_alignment(
                 ref_fasta, unplaced_fa,
@@ -721,9 +826,7 @@ def _align_unplaced_to_scaffolds(unplaced: set, scaffold_regions: list,
             futures = {pool.submit(_align_one, r): r for r in scaffold_regions}
             for future in as_completed(futures):
                 paf = future.result()
-                entries = parse_nucleotide_paf(paf)
-                all_entries.extend(entries)
-
+                all_entries.extend(parse_nucleotide_paf(paf))
         return all_entries
     finally:
         if os.path.exists(unplaced_fa):
@@ -741,20 +844,15 @@ def _add_extension_edges(sg, paf_entries: list, scaffold_regions: list,
 
     Returns count of edges added.
     """
-    # Group PAF entries by query contig — keep best alignment overall
-    best_per_query = {}
-    for entry in paf_entries:
-        query = entry['query']
-        prev = best_per_query.get(query)
-        if prev is None or entry['nmatch'] > prev['nmatch']:
-            best_per_query[query] = entry
-
     # For each scaffold region, find unplaced contigs that align nearby
     region_by_idx = {r.scaffold_idx: r for r in scaffold_regions}
 
-    # Map: (query, scaf_idx) -> best PAF entry for that query+scaffold pair
-    best_per_pair = {}
-    for query, entry in best_per_query.items():
+    # Consider ALL alignments (including secondary) so a contig whose primary
+    # hit is far from every scaffold can still extend via a secondary hit near
+    # a scaffold endpoint.  Keep the best (by nmatch) per (query, scaffold).
+    best_per_pair: dict[tuple[str, int], dict] = {}
+    for entry in paf_entries:
+        query = entry['query']
         al_start = min(entry['rstart'], entry['rend'])
         al_end = max(entry['rstart'], entry['rend'])
         # samtools faidx headers include region coords (e.g. "FCY04A:50141-3543086"),
@@ -763,12 +861,13 @@ def _add_extension_edges(sg, paf_entries: list, scaffold_regions: list,
         for region in scaffold_regions:
             if paf_chr != region.ref_chr:
                 continue
-            # Is this alignment near the scaffold region?
             gap_to_left = region.ref_start - al_end
             gap_to_right = al_start - region.ref_end
             best_gap = max(gap_to_left, gap_to_right)  # positive = outside
             if best_gap > gap_max:
                 continue
+            # Rank by raw nmatch (matches historical behavior); the edge
+            # weight computed downstream additionally folds in identity+mapq.
             key = (query, region.scaffold_idx)
             prev = best_per_pair.get(key)
             if prev is None or entry['nmatch'] > prev['nmatch']:
@@ -981,48 +1080,83 @@ def _merge_scaffolds_on_cover(cover, contig_ref: dict,
 
 def _refine_contig_coordinates(contig_ref: dict, contig_lengths: dict,
                                 ref_fasta: str, query_fasta: str,
-                                config, threads: int):
-    """Refine reference coordinates by aligning ALL placed contigs to reference.
+                                config, threads: int,
+                                ref_index: str | None = None,
+                                align_cache: dict | None = None):
+    """Refine reference coordinates for placed contigs.
 
-    Protein-placed contigs from the Block Tree have synthetic coordinates
-    (inferred from protein ID ordering, not real genomic positions).  This
-    step runs a minimap2 alignment of all placed contigs against the full
-    reference genome and updates *contig_ref* with real genomic coordinates.
+    Contigs with a cached alignment (from the extension passes) reuse it
+    directly.  Only contigs WITHOUT a cache entry (typically protein-placed
+    contigs with synthetic coordinates) are realigned precisely with -c.
 
-    Returns (strand_map, mapq_map) — {contig: '+'/'-'} and {contig: mapq}
-    from the best alignment per contig (empty dicts on failure); used to
-    orient AGP components.
+    Returns (strand_map, mapq_map); updates *contig_ref* in place.
     """
     import tempfile, os, subprocess
-    from nearscaff.nucleotide import parse_nucleotide_paf, _extract_contigs
+    from nearscaff.nucleotide import parse_nucleotide_paf, _extract_contigs, align_to_full_reference
 
     placed_contigs = list(contig_ref.keys())
     if not placed_contigs:
         return {}, {}
 
-    # Write placed contigs to temp FASTA
-    fd, placed_fa = tempfile.mkstemp(suffix='.fa')
+    align_cache = align_cache or {}
+    contig_strand: dict[str, str] = {}
+    contig_mapq: dict[str, int] = {}
+
+    # 1) Reuse cached alignments
+    for c in placed_contigs:
+        if c in align_cache:
+            e = align_cache[c]
+            if e.get('chr') and len(e['chr']) > 2:
+                contig_ref[c] = (e['chr'], e['r_start'], e['r_end'])
+                contig_strand[c] = e['strand']
+                contig_mapq[c] = e['mapq']
+
+    # 2) Precisely realign only the contigs missing from cache
+    missing = [c for c in placed_contigs if c not in align_cache]
+    if not missing:
+        logger.info("  %d contigs refined from cache (no realignment)", len(contig_strand))
+        return contig_strand, contig_mapq
+
+    fd, missing_fa = tempfile.mkstemp(suffix='.fa')
     os.close(fd)
     try:
-        _extract_contigs(query_fasta, placed_contigs, placed_fa)
+        _extract_contigs(query_fasta, missing, missing_fa)
 
-        # Align against the full reference
-        cmd = ["minimap2", "-t", str(threads), "-x", config.nucleotide.preset,
-               "-c", ref_fasta, placed_fa]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.warning("Final precise alignment failed: %s", result.stderr)
-            return {}, {}
+        if ref_index is not None:
+            try:
+                # Refine only needs each contig's BEST alignment (for coords +
+                # strand), so disable secondary alignments (--secondary=no).
+                paf = align_to_full_reference(ref_index, missing_fa,
+                                              preset=config.nucleotide.preset,
+                                              secondary=0,
+                                              with_cigar=True, threads=threads)
+            except RuntimeError as e:
+                logger.warning("Final precise alignment (index) failed (%s); "
+                               "retrying without index", e)
+                paf = None
+                ref_index = None
+            if ref_index is None:
+                cmd = ["minimap2", "-t", str(threads), "-x", config.nucleotide.preset,
+                       "-c", ref_fasta, missing_fa]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    logger.warning("Final precise alignment failed: %s", result.stderr)
+                    return contig_strand, contig_mapq
+                paf = result.stdout
+        else:
+            cmd = ["minimap2", "-t", str(threads), "-x", config.nucleotide.preset,
+                   "-c", ref_fasta, missing_fa]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.warning("Final precise alignment failed: %s", result.stderr)
+                return contig_strand, contig_mapq
+            paf = result.stdout
 
-        entries = parse_nucleotide_paf(result.stdout)
-        logger.info("  %d alignments from final precise pass", len(entries))
+        entries = parse_nucleotide_paf(paf)
+        logger.info("  %d alignments from final precise pass (%d missing contigs)",
+                    len(entries), len(missing))
 
-        # Update contig_ref with real coordinates; keep original tier's chr if
-        # alignment chromosome matches (strip samtools region suffix).
-        # Also record per-contig strand — needed to orient AGP components.
-        # A contig may have several alignments; use the best one (longest
-        # aligned block, then highest mapq) instead of an arbitrary one.
-        best = {}
+        best: dict[str, tuple] = {}
         for entry in entries:
             query = entry['query']
             if query not in contig_ref:
@@ -1031,27 +1165,23 @@ def _refine_contig_coordinates(contig_ref: dict, contig_lengths: dict,
             if query not in best or key > best[query][0]:
                 best[query] = (key, entry)
 
-        contig_strand = {}
-        contig_mapq = {}
         updated = 0
         for query, (_key, entry) in best.items():
             paf_chr = entry['ref_chr'].split(':')[0]
             rs = min(entry['rstart'], entry['rend'])
             re = max(entry['rstart'], entry['rend'])
-            # Only update if the alignment chromosome is reasonable
-            # (don't overwrite chr if PAF chr is totally different)
-            old_chr = contig_ref[query][0]
             if paf_chr and len(paf_chr) > 2:
                 contig_ref[query] = (paf_chr, rs, re)
                 contig_strand[query] = entry['strand']
                 contig_mapq[query] = entry['mapq']
                 updated += 1
 
-        logger.info("  %d contig coordinates refined", updated)
+        logger.info("  %d contig coordinates refined (%d from realignment)",
+                    len(contig_strand), updated)
         return contig_strand, contig_mapq
     finally:
-        if os.path.exists(placed_fa):
-            os.unlink(placed_fa)
+        if os.path.exists(missing_fa):
+            os.unlink(missing_fa)
 
 
 def _write_tiered_paf(output_dir: str, root, contig_ref: dict,

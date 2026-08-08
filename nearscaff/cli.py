@@ -34,9 +34,14 @@ def main():
     p_run.add_argument("--no-best-buddy", action="store_true",
                        help="Disable best-buddy weight scaling")
     p_run.add_argument("--nucleotide-passes", nargs="*",
-                       default=["asm5", "asm10", "asm20"],
+                       default=["asm5", "asm20"],
                        choices=["asm5", "asm10", "asm15", "asm20"],
-                       help="Nucleotide extension passes (default: asm5 asm10 asm20)")
+                       help="Nucleotide extension passes (default: asm5 asm20)")
+    p_run.add_argument("--secondary-alignments", type=int, default=5,
+                       help="minimap2 -N secondary alignments for extension "
+                       "(default: 5)")
+    p_run.add_argument("--no-reuse-index", action="store_true",
+                       help="Do not build/reuse a minimap2 reference index")
     p_run.add_argument("--keep-intermediate", action="store_true",
                        help="Keep intermediate files")
 
@@ -56,9 +61,14 @@ def main():
     p_scaf.add_argument("--unknown-gap-size", type=int, default=100,
                         help="Default unknown gap size (default: 100)")
     p_scaf.add_argument("--nucleotide-passes", nargs="*",
-                        default=["asm5", "asm10", "asm20"],
+                        default=["asm5", "asm20"],
                         choices=["asm5", "asm10", "asm15", "asm20"],
-                        help="Nucleotide extension passes (default: asm5 asm10 asm20)")
+                        help="Nucleotide extension passes (default: asm5 asm20)")
+    p_scaf.add_argument("--secondary-alignments", type=int, default=5,
+                        help="minimap2 -N secondary alignments for extension "
+                        "(default: 5)")
+    p_scaf.add_argument("--no-reuse-index", action="store_true",
+                        help="Do not build/reuse a minimap2 reference index")
 
     # ---- subcommand: kmer-phase ----
     p_kp = sub.add_parser(
@@ -148,6 +158,10 @@ def _build_config(args) -> NearscaffConfig:
         config.nucleotide.preset = preset["minimap2_preset"]
     if hasattr(args, "nucleotide_passes"):
         config.nucleotide.nucleotide_passes = args.nucleotide_passes or []
+    if hasattr(args, "secondary_alignments"):
+        config.nucleotide.secondary_alignments = args.secondary_alignments
+    if hasattr(args, "no_reuse_index") and args.no_reuse_index:
+        config.nucleotide.reuse_ref_index = False
     return config
 
 

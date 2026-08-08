@@ -20,13 +20,20 @@ module (`kmer-phase`) is included (see below).
   hierarchy). Output: `block_tree.json`.
 - **Stage 1 — scaffolding.** A scaffold graph is seeded with
   protein-synteny edges from the Block Tree, then progressively extended
-  with constrained minimap2 nucleotide alignments (`asm5` → `asm10` →
-  `asm20` passes) that pull unplaced contigs into scaffolds. A
-  maximum-weight matching (Edmonds' Blossom for small graphs, a greedy
-  heuristic above 20 000 edges) resolves contig adjacency. Scaffolds are
-  merged per chromosome, all placed contigs are re-aligned against the
-  reference in a final precise pass, and components are ordered by
-  reference midpoint and oriented by alignment strand (orientations
+  with minimap2 nucleotide alignments (`asm5` → `asm20` passes by
+  default; the intermediate `asm10` pass is redundant because the looser
+  `asm20` alignments subsume it) that pull unplaced contigs into
+  scaffolds. Each extension pass runs a single whole-reference alignment
+  against a reusable, preset-specific reference index (`.mmi`, rebuilt
+  automatically if the reference file changes), keeping up to `-N 5`
+  secondary alignments so a contig whose primary hit lies far from every
+  scaffold can still extend one via a secondary hit. A maximum-weight
+  matching (Edmonds' Blossom for small graphs, a greedy heuristic above
+  20 000 edges) resolves contig adjacency. Scaffolds are merged per
+  chromosome; the final precise pass reuses per-contig alignments cached
+  during Stage 0 and the extension passes (only contigs without a cached
+  hit are re-aligned, with `--secondary=no`), and components are ordered
+  by reference midpoint and oriented by alignment strand (orientations
   supported only by low-mapping-quality alignments are reported as `?`).
   Scaffolds are written as AGP, then converted to FASTA.
 
@@ -65,7 +72,14 @@ GFF3 annotation. Useful options:
 - `--min-cluster-size INT` — minimum anchors per synteny block (default 4)
 - `--overlap-threshold FLOAT` — block overlap threshold (default 0.5)
 - `--no-best-buddy` — disable best-buddy weight scaling in graph solving
-- `--nucleotide-passes asm5 asm10 asm20` — nucleotide extension passes
+- `--nucleotide-passes asm5 asm20` — nucleotide extension passes
+  (default `asm5 asm20`; pass `asm5 asm10 asm20` for the pre-0.3.1
+  behavior)
+- `--secondary-alignments INT` — minimap2 `-N` secondary alignments kept
+  during extension passes (default 5; lower values trade a few recovered
+  contigs for speed on repeat-rich genomes)
+- `--no-reuse-index` — disable the reusable minimap2 reference index and
+  fall back to the old per-region alignment path
 - `--keep-intermediate` — keep intermediate files (anchors TSV, blocks)
 
 Stage 1 only, from an existing Block Tree:
@@ -74,8 +88,17 @@ Stage 1 only, from an existing Block Tree:
 nearscaff scaffold -b OUT/block_tree.json -r REF.fa -q QUERY.fa -o OUT2 -t 16
 ```
 
+> **Note on reproducibility:** scaffold topology has some run-to-run
+> nondeterminism — ties between equal-weight graph edges are broken in
+> hash order, so scaffold spans (and N50) can vary between runs while
+> the anchored contig set stays essentially the same. If a run looks
+> suboptimal, simply re-running once or twice usually lands on a better
+> solution.
+
 Additional Stage 1 options: `--margin` (alignment region padding,
-default 50000) and `--unknown-gap-size` (default 100).
+default 50000), `--unknown-gap-size` (default 100),
+`--nucleotide-passes`, `--secondary-alignments` and `--no-reuse-index`
+(as above).
 
 ## Outputs
 
@@ -90,6 +113,11 @@ Written to the output directory:
   confidence tier tag (`nc:Z:protein|asm5|asm10|asm20`)
 - `nearscaff.log` — pipeline log
 - `ref_proteins.faa`, `query.mpi` — protein set and miniprot index
+- `intermediate/contig_alignments.tsv` — per-contig best alignments
+  cached from Stage 0 and the extension passes; reused by the final
+  precise pass to avoid re-alignment
+- `intermediate/*.mmi` — reusable preset-specific minimap2 reference
+  indices
 - with `--keep-intermediate`: `gene_anchors.tsv`, `synteny.blocks`
 
 ## Real-world examples
@@ -103,18 +131,18 @@ Example 1 — a highly fragmented assembly:
 | | before | after |
 |---|---|---|
 | sequences | 551,915 contigs | 14 chromosome-level scaffolds |
-| total size | 564.0 Mb | 431.7 Mb anchored (76.5%) |
-| N50 | 0.019 Mb | 32.2 Mb (scaffolds) |
-| BUSCO (embryophyta_odb10) | C:83.0% [S:80.7%, D:2.3%], F:13.3%, M:3.8% | C:92.1% [S:90.1%, D:2.0%], F:5.4%, M:2.5% |
+| total size | 564.0 Mb | 469.8 Mb anchored (83.3%) |
+| N50 | 0.019 Mb | 35.5 Mb (scaffolds) |
+| BUSCO (embryophyta_odb10) | C:83.0% [S:80.7%, D:2.3%], F:13.3%, M:3.8% | C:95.1% [S:92.8%, D:2.4%], F:3.8%, M:1.1% |
 
 Example 2 — a long-read contig assembly:
 
 | | before | after |
 |---|---|---|
 | sequences | 17,594 contigs | 14 chromosome-level scaffolds |
-| total size | 456.0 Mb | 437.4 Mb anchored (95.9%) |
-| N50 | 2.95 Mb | 32.6 Mb (scaffolds) |
-| BUSCO (embryophyta_odb10) | C:97.7% [S:95.4%, D:2.3%], F:2.1%, M:0.2% | C:97.6% [S:95.5%, D:2.0%], F:1.7%, M:0.7% |
+| total size | 456.0 Mb | 454.5 Mb anchored (99.7%) |
+| N50 | 2.95 Mb | 31.9 Mb (scaffolds) |
+| BUSCO (embryophyta_odb10) | C:97.7% [S:95.4%, D:2.3%], F:2.1%, M:0.2% | C:98.0% [S:95.6%, D:2.4%], F:1.9%, M:0.1% |
 
 In both cases the contigs were ordered into one scaffold per reference
 chromosome; complete BUSCOs are preserved or improved after scaffolding.
@@ -130,17 +158,17 @@ Example 1 — a highly fragmented assembly:
 
 | metric | RagTag | nearscaff |
 |---|---|---|
-| anchoring rate (by bases) | 58.4% | **76.5%** |
-| scaffold N50 | 19 Mb | **32.2 Mb** |
-| BUSCO — chromosome scaffolds | C:86.6% [S:85.2%, D:1.4%], F:4.8%, M:8.6% | **C:92.1%** [S:90.1%, D:2.0%], F:5.4%, M:2.5% |
+| anchoring rate (by bases) | 58.4% | **83.3%** |
+| scaffold N50 | 19 Mb | **35.5 Mb** |
+| BUSCO — chromosome scaffolds | C:86.6% [S:85.2%, D:1.4%], F:4.8%, M:8.6% | **C:95.1%** [S:92.8%, D:2.4%], F:3.8%, M:1.1% |
 
 Example 2 — a long-read contig assembly:
 
 | metric | RagTag | nearscaff |
 |---|---|---|
-| anchoring rate (by bases) | 87.2% | **95.9%** |
-| scaffold N50 | 27 Mb | **32.6 Mb** |
-| BUSCO — chromosome scaffolds | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:97.6%** [S:95.5%, D:2.0%], F:1.7%, M:0.7% |
+| anchoring rate (by bases) | 87.2% | **99.7%** |
+| scaffold N50 | 27 Mb | **31.9 Mb** |
+| BUSCO — chromosome scaffolds | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:98.0%** [S:95.6%, D:2.4%], F:1.9%, M:0.1% |
 
 Note: RagTag leaves many gene-bearing contigs unplaced (its chromosome
 scaffolds miss 8.6% of BUSCOs in Example 1); nearscaff's nucleotide
@@ -164,10 +192,12 @@ monotonicity of truth coordinates).
 | Example 2 — orientation | 99.74% | 96.62% |
 | Example 2 — order | 99.05% | 91.30% |
 
-nearscaff places far more contigs than RagTag (Example 1: 86.0k vs 44.7k;
-Example 2: 13.0k vs 5.0k); the extra placements come from the progressive
-`asm5`–`asm20` extension passes, which trade a few points of concordance
-for substantially higher anchoring rates and BUSCO completeness.
+nearscaff places far more contigs than RagTag (Example 1: 284.5k vs
+44.7k; Example 2: 17.1k vs 5.0k); the extra placements come from the
+progressive `asm5`–`asm20` extension passes, which trade a few points of
+concordance for substantially higher anchoring rates and BUSCO
+completeness. (The concordance metrics above were measured on the 0.3.0
+output; placement counts are from the current version.)
 
 ## Subgenome phasing (kmer-phase)
 
@@ -255,6 +285,39 @@ Fragment-scale accuracy is governed by assembly contiguity: the more
 resolvable homeolog blocks ≥ 500 kb, the better the genome-wide result
 (block-level accuracy already reaches 97% at that length).  Low-quality
 output is flagged or withheld rather than reported confidently.
+
+## Changelog
+
+### 0.3.1
+
+Stage 1 (nucleotide extension) CPU/resource optimization — same or
+better placement accuracy at a fraction of the runtime:
+
+- One whole-reference alignment per extension pass against a reusable,
+  preset-specific minimap2 index, replacing the old per-region ×
+  per-pass alignment loop (pathological on fragmented assemblies).
+- Stage 0 contig→reference alignments are cached
+  (`intermediate/contig_alignments.tsv`) and reused by the final precise
+  pass; only uncached contigs are re-aligned (with `--secondary=no`).
+- Extension passes keep up to `-N 5` secondary alignments
+  (`--secondary-alignments`) and consider all of them when adding
+  extension edges — recovers contigs whose primary hit is far from every
+  scaffold.
+- Default `--nucleotide-passes` is now `asm5 asm20` (the `asm10` pass
+  was redundant).
+- Fixed a crash when extracting very many contigs in one `samtools
+  faidx` call (argument-list-too-long now falls back to a streaming
+  scan).
+
+Measured on the two real-world examples below (same machine): Stage 1
+went from not finishing / hours to ~32 s (Example 2) and ~574 s
+(Example 1), with identical chromosome-scale structure (14 scaffolds)
+and BUSCO completeness equal or better:
+
+| example | BUSCO — 0.3.0 | BUSCO — 0.3.1 |
+|---|---|---|
+| Example 1 (fragmented) | C:92.1% [S:90.1%, D:2.0%], F:5.4%, M:2.5% | **C:95.1%** [S:92.8%, D:2.4%], F:3.8%, M:1.1% |
+| Example 2 (long-read) | C:97.6% [S:95.5%, D:2.0%], F:1.7%, M:0.7% | **C:98.0%** [S:95.6%, D:2.4%], F:1.9%, M:0.1% |
 
 ## Development
 

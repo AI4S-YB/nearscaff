@@ -38,7 +38,10 @@ class NucleotideConfig:
     preset: str = "asm5"
     region_margin: int = 50000
     boundary_window: int = 2000
-    nucleotide_passes: list[str] = field(default_factory=lambda: ["asm5", "asm10", "asm20"])
+    nucleotide_passes: list[str] = field(default_factory=lambda: ["asm5", "asm20"])
+    secondary_alignments: int = 5          # minimap2 -N：挽回 scaffold 附近的次级比对
+    reuse_ref_index: bool = True           # 构建/复用 minimap2 参考索引
+    index_dir: str | None = None           # 索引与缓存目录；None 落到 <output>/intermediate/
 
 
 @dataclass

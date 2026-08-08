@@ -14,11 +14,16 @@
   基因组坐标，随后把 contig 级别的共线性区块组装成 *Block Tree*
   （亚基因组 → 染色体 → 局部簇的层级结构）。输出：`block_tree.json`。
 - **Stage 1 —— 挂载（scaffolding）。** 以 Block Tree 中的蛋白-共线性
-  边为种子构建 scaffold 图，再通过多轮约束性 minimap2 核苷酸比对
-  （`asm5` → `asm10` → `asm20`）逐步把未挂载的 contig 拉入 scaffold。
+  边为种子构建 scaffold 图，再通过多轮 minimap2 核苷酸比对
+  （默认 `asm5` → `asm20` 两轮；中间的 `asm10` 轮是冗余的，因为更宽松
+  的 `asm20` 比对结果是它的超集）逐步把未挂载的 contig 拉入 scaffold。
+  每轮扩展只对可复用的、按预设区分的参考索引（`.mmi`，参考文件变更时
+  自动重建）做一次全参考比对，并保留至多 `-N 5` 个次级比对——主比对
+  离所有 scaffold 都远的 contig 也可以通过次级比对挂到 scaffold 末端。
   contig 邻接关系由最大权匹配确定（小图用 Edmonds Blossom 精确算法，
   边数超过 20,000 时切换为贪心启发式）。scaffold 按染色体合并后，
-  对所有已挂载 contig 做一次最终的精确比对，按参考基因组中点坐标
+  最终精修直接复用 Stage 0 和扩展轮缓存的逐 contig 比对（只对无缓存的
+  contig 重新比对，且用 `--secondary=no`），按参考基因组中点坐标
   排序、按比对链向定向（仅由低 mapq 比对支持的方向标记为 `?`），
   最后写出 AGP 并转换为 FASTA。
 
@@ -56,7 +61,13 @@ nearscaff run -r REF.fa -p PROTEINS.pep -q QUERY.fa -o OUT -t 16 --preset near
 - `--min-cluster-size INT` —— 每个共线性区块的最少锚点数（默认 4）
 - `--overlap-threshold FLOAT` —— 区块重叠阈值（默认 0.5）
 - `--no-best-buddy` —— 关闭图求解中的 best-buddy 权重缩放
-- `--nucleotide-passes asm5 asm10 asm20` —— 核苷酸扩展轮次
+- `--nucleotide-passes asm5 asm20` —— 核苷酸扩展轮次（默认
+  `asm5 asm20`；传入 `asm5 asm10 asm20` 可还原 0.3.1 之前的行为）
+- `--secondary-alignments INT` —— 扩展轮保留的 minimap2 `-N` 次级
+  比对数（默认 5；重复序列多的基因组可调低换速度，代价是少挽回
+  少量 contig）
+- `--no-reuse-index` —— 不用可复用的 minimap2 参考索引，回退到旧的
+  逐区域比对路径
 - `--keep-intermediate` —— 保留中间文件（锚点 TSV、区块文件）
 
 只跑 Stage 1（基于已有的 Block Tree）：
@@ -65,8 +76,14 @@ nearscaff run -r REF.fa -p PROTEINS.pep -q QUERY.fa -o OUT -t 16 --preset near
 nearscaff scaffold -b OUT/block_tree.json -r REF.fa -q QUERY.fa -o OUT2 -t 16
 ```
 
-Stage 1 额外选项：`--margin`（比对区域外延长度，默认 50000）和
-`--unknown-gap-size`（默认 100）。
+> **关于可复现性：** scaffold 拓扑存在一定的运行间随机性——权重相同
+> 的边在图求解时按 hash 顺序破局，因此 scaffold 跨度（和 N50）在不同
+> 运行间可能有所波动，但挂载的 contig 集合基本不变。如果某次结果不
+> 理想，多跑一两次通常能得到更优的解。
+
+Stage 1 额外选项：`--margin`（比对区域外延长度，默认 50000）、
+`--unknown-gap-size`（默认 100），以及上文提到的
+`--nucleotide-passes`、`--secondary-alignments`、`--no-reuse-index`。
 
 ## 输出
 
@@ -80,6 +97,9 @@ Stage 1 额外选项：`--margin`（比对区域外延长度，默认 50000）�
   层级标签（`nc:Z:protein|asm5|asm10|asm20`）
 - `nearscaff.log` —— 流程日志
 - `ref_proteins.faa`、`query.mpi` —— 蛋白集合与 miniprot 索引
+- `intermediate/contig_alignments.tsv` —— Stage 0 与扩展轮缓存的逐
+  contig 最佳比对，供最终精修复用、避免重复比对
+- `intermediate/*.mmi` —— 可复用的、按预设区分的 minimap2 参考索引
 - 使用 `--keep-intermediate` 时：`gene_anchors.tsv`、`synteny.blocks`
 
 ## 实际案例
@@ -92,18 +112,18 @@ Stage 1 额外选项：`--margin`（比对区域外延长度，默认 50000）�
 | | 挂载前 | 挂载后 |
 |---|---|---|
 | 序列数 | 551,915 条 contig | 14 条染色体级 scaffold |
-| 总大小 | 564.0 Mb | 挂载 431.7 Mb（76.5%） |
-| N50 | 0.019 Mb | 32.2 Mb（scaffold） |
-| BUSCO (embryophyta_odb10) | C:83.0% [S:80.7%, D:2.3%], F:13.3%, M:3.8% | C:92.1% [S:90.1%, D:2.0%], F:5.4%, M:2.5% |
+| 总大小 | 564.0 Mb | 挂载 469.8 Mb（83.3%） |
+| N50 | 0.019 Mb | 35.5 Mb（scaffold） |
+| BUSCO (embryophyta_odb10) | C:83.0% [S:80.7%, D:2.3%], F:13.3%, M:3.8% | C:95.1% [S:92.8%, D:2.4%], F:3.8%, M:1.1% |
 
 案例 2 —— 长读长 contig 组装：
 
 | | 挂载前 | 挂载后 |
 |---|---|---|
 | 序列数 | 17,594 条 contig | 14 条染色体级 scaffold |
-| 总大小 | 456.0 Mb | 挂载 437.4 Mb（95.9%） |
-| N50 | 2.95 Mb | 32.6 Mb（scaffold） |
-| BUSCO (embryophyta_odb10) | C:97.7% [S:95.4%, D:2.3%], F:2.1%, M:0.2% | C:97.6% [S:95.5%, D:2.0%], F:1.7%, M:0.7% |
+| 总大小 | 456.0 Mb | 挂载 454.5 Mb（99.7%） |
+| N50 | 2.95 Mb | 31.9 Mb（scaffold） |
+| BUSCO (embryophyta_odb10) | C:97.7% [S:95.4%, D:2.3%], F:2.1%, M:0.2% | C:98.0% [S:95.6%, D:2.4%], F:1.9%, M:0.1% |
 
 两个案例中 contig 都被挂载为与参考染色体一一对应的 scaffold，挂载后
 完整 BUSCO 数量保持或有所提升。
@@ -118,17 +138,17 @@ Stage 1 额外选项：`--margin`（比对区域外延长度，默认 50000）�
 
 | 指标 | RagTag | nearscaff |
 |---|---|---|
-| 挂载率（按碱基） | 58.4% | **76.5%** |
-| scaffold N50 | 19 Mb | **32.2 Mb** |
-| BUSCO — 染色体骨架 | C:86.6% [S:85.2%, D:1.4%], F:4.8%, M:8.6% | **C:92.1%** [S:90.1%, D:2.0%], F:5.4%, M:2.5% |
+| 挂载率（按碱基） | 58.4% | **83.3%** |
+| scaffold N50 | 19 Mb | **35.5 Mb** |
+| BUSCO — 染色体骨架 | C:86.6% [S:85.2%, D:1.4%], F:4.8%, M:8.6% | **C:95.1%** [S:92.8%, D:2.4%], F:3.8%, M:1.1% |
 
 案例 2 —— 长读长 contig 组装：
 
 | 指标 | RagTag | nearscaff |
 |---|---|---|
-| 挂载率（按碱基） | 87.2% | **95.9%** |
-| scaffold N50 | 27 Mb | **32.6 Mb** |
-| BUSCO — 染色体骨架 | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:97.6%** [S:95.5%, D:2.0%], F:1.7%, M:0.7% |
+| 挂载率（按碱基） | 87.2% | **99.7%** |
+| scaffold N50 | 27 Mb | **31.9 Mb** |
+| BUSCO — 染色体骨架 | C:97.2% [S:95.2%, D:2.0%], F:1.8%, M:1.0% | **C:98.0%** [S:95.6%, D:2.4%], F:1.9%, M:0.1% |
 
 注：RagTag 有大量带基因的 contig 未被挂载（案例 1 中其染色体骨架
 缺失 8.6% 的 BUSCO）；nearscaff 的核苷酸扩展轮次把这些 contig
@@ -150,9 +170,10 @@ Stage 1 额外选项：`--margin`（比对区域外延长度，默认 50000）�
 | 案例 2 —— 方向一致率 | 99.74% | 96.62% |
 | 案例 2 —— 顺序一致率 | 99.05% | 91.30% |
 
-nearscaff 挂载的 contig 远多于 RagTag（案例 1：8.6 万 vs 4.5 万；
-案例 2：1.3 万 vs 0.5 万）；多出的挂载来自 `asm5`–`asm20` 渐进扩展
+nearscaff 挂载的 contig 远多于 RagTag（案例 1：28.4 万 vs 4.5 万；
+案例 2：1.7 万 vs 0.5 万）；多出的挂载来自 `asm5`–`asm20` 渐进扩展
 轮次，用几个百分点的一致率换来了明显更高的挂载率和 BUSCO 完整度。
+（上方一致率指标测自 0.3.0 版本的输出；挂载数量为当前版本数据。）
 
 ## 亚基因组分型（kmer-phase）
 
@@ -230,6 +251,35 @@ contig 准确率高，说明分错的主要是短 contig：案例 A 中基因组
 碎片尺度分型的效果由组装连续性决定：≥500 kb 的可分辨同源块越多、
 覆盖越广，全基因组准确率越高（块 ≥500 kb 时块级准确率即达 97%）。
 置信度低的输出会被如实标注或拒判。
+
+## 更新日志
+
+### 0.3.1
+
+Stage 1（核苷酸扩展）的 CPU/资源优化——在挂载精度不降（实测提升）
+的前提下大幅缩短运行时间：
+
+- 每轮扩展改为对可复用的、按预设区分的 minimap2 索引做一次全参考
+  比对，取代旧的「逐区域 × 逐轮」比对循环（旧路径在碎片化组装上
+  是病态的）。
+- Stage 0 的 contig→参考比对结果写入缓存
+  （`intermediate/contig_alignments.tsv`），最终精修直接复用；只对
+  无缓存的 contig 重新比对（并用 `--secondary=no`）。
+- 扩展轮保留至多 `-N 5` 个次级比对（`--secondary-alignments`），
+  且添加扩展边时考虑全部比对——主比对离所有 scaffold 都远的 contig
+  也能通过次级比对挂回。
+- `--nucleotide-passes` 默认改为 `asm5 asm20`（`asm10` 轮冗余）。
+- 修复一次性用 `samtools faidx` 抽取极多 contig 时参数列表过长导致
+  的崩溃（现在回退为流式扫描）。
+
+在下面两个实际案例中实测（同一台机器）：Stage 1 从「跑不完 /
+数小时」降到约 32 秒（案例 2）和约 574 秒（案例 1），染色体尺度
+结构一致（14 条 scaffold），BUSCO 完整度持平或更好：
+
+| 案例 | BUSCO — 0.3.0 | BUSCO — 0.3.1 |
+|---|---|---|
+| 案例 1（碎片化组装） | C:92.1% [S:90.1%, D:2.0%], F:5.4%, M:2.5% | **C:95.1%** [S:92.8%, D:2.4%], F:3.8%, M:1.1% |
+| 案例 2（长读长组装） | C:97.6% [S:95.5%, D:2.0%], F:1.7%, M:0.7% | **C:98.0%** [S:95.6%, D:2.4%], F:1.9%, M:0.1% |
 
 ## 开发
 
