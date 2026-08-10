@@ -1123,7 +1123,7 @@ def _merge_scaffolds_on_cover(cover, contig_ref: dict,
         for ctg in bases:
             if ctg in contig_ref:
                 chr_name, rs, re = contig_ref[ctg]
-                chr_votes[chr_name] += 1
+                chr_votes[chr_name] += contig_lengths.get(ctg, 0)
                 if rs < min_pos:
                     min_pos = rs
                 if re > max_pos:

@@ -4,6 +4,7 @@ import pytest
 
 from nearscaff.config import NearscaffConfig
 from nearscaff.pipeline import _enforce_chromosome_purity
+from nearscaff.pipeline import _merge_scaffolds_on_cover
 
 
 def test_scaffold_config_chr_purity_defaults():
@@ -115,3 +116,33 @@ def test_single_significant_chromosome_not_split():
                                        min_share=0.20, min_len=1_000_000)
     assert n_cut == 0
     assert nx.number_connected_components(cover) == 1
+
+
+def test_merge_does_not_rejoin_separate_significant_chromosomes():
+    """Regression: Stage 1c must not merge two components whose count-majority
+    best_chr collides on a shared minor chromosome. Length-weighted voting
+    keeps each component on its own (single) significant chromosome."""
+    INF = float("inf")
+
+    def chain(g, bases):
+        for b in bases:
+            g.add_edge(b + "_b", b + "_e", weight=INF)
+        for i in range(len(bases) - 1):
+            g.add_edge(bases[i] + "_e", bases[i + 1] + "_b", weight=0.5)
+
+    cover = nx.Graph()
+    chain(cover, ["A", "M1", "M2"])   # chr1 anchor + 2 minor-chr contigs
+    chain(cover, ["B", "M3", "M4"])   # chr2 anchor + 2 minor-chr contigs
+    contig_ref = {"A": ("chr1", 1, 2_000_000), "B": ("chr2", 1, 2_000_000),
+                  "M1": ("chrMinor", 1, 300_000), "M2": ("chrMinor", 1, 300_000),
+                  "M3": ("chrMinor", 1, 300_000), "M4": ("chrMinor", 1, 300_000)}
+    lengths = {"A": 2_000_000, "B": 2_000_000, "M1": 300_000, "M2": 300_000,
+               "M3": 300_000, "M4": 300_000}
+
+    _enforce_chromosome_purity(cover, contig_ref, lengths, 0.20, 1_000_000)
+    _merge_scaffolds_on_cover(cover, contig_ref, lengths, gap_min=0)
+
+    # No final scaffold may span both chr1 and chr2.
+    for cc in nx.connected_components(cover):
+        chs = {contig_ref[b][0] for b in (n[:-2] for n in cc) if b in contig_ref}
+        assert not ({"chr1", "chr2"} <= chs), f"cross-chromosome merge survived: {chs}"
