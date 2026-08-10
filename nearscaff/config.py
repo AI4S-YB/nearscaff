@@ -53,6 +53,9 @@ class ScaffoldConfig:
     best_buddy_scale: bool = True
     keep_unplaced: int | None = None  # None=off; else min contig length
                                       # (0 = append every unplaced contig)
+    enforce_chr_purity: bool = True     # 切断跨染色体的 cover-graph 桥边
+    min_chr_share: float = 0.20         # significant chr 的最小长度占比
+    min_chr_len: int = 1_000_000        # significant chr 的最小总长（bp）
 
 
 @dataclass
