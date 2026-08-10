@@ -989,6 +989,90 @@ def _add_adjacent_chromosome_edges(sg, contig_ref: dict,
     return n_added
 
 
+def _enforce_chromosome_purity(cover, contig_ref: dict, contig_lengths: dict,
+                                min_share: float = 0.20,
+                                min_len: int = 1_000_000) -> int:
+    """Cut cover-graph edges bridging different significant chromosomes.
+
+    For each connected component, a chromosome is "significant" when its
+    total contig length is >= *min_share* of the component AND >= *min_len*.
+    Non-intra-contig edges whose endpoints resolve to different significant
+    chromosomes are removed (intra-contig ``inf`` edges are never cut), so
+    every resulting component spans at most one significant chromosome.
+    Minor / unknown contigs are labelled by their highest-weight significant
+    neighbour so they stay attached rather than fragmenting into noise.
+
+    Mutates *cover* in place.  Returns the number of edges removed.
+    """
+    import networkx as nx
+    from collections import Counter
+
+    n_cut = 0
+    for cc_nodes in list(nx.connected_components(cover)):
+        sub = cover.subgraph(cc_nodes)
+
+        # Per-contig reference chromosome + per-chromosome length tally.
+        contig_chr = {}
+        chr_len = Counter()
+        for node in cc_nodes:
+            base = node[:-2]
+            if base in contig_chr:
+                continue
+            if base in contig_ref:
+                ch = contig_ref[base][0]
+                contig_chr[base] = ch
+                chr_len[ch] += contig_lengths.get(base, 0)
+            else:
+                contig_chr[base] = None
+
+        total = sum(chr_len.values())
+        if total <= 0:
+            continue
+        significant = {ch for ch, L in chr_len.items()
+                       if L / total >= min_share and L >= min_len}
+        if len(significant) < 2:
+            continue  # already pure (single dominant chr) or all-noise
+
+        # Non-intra adjacency: base -> [(neighbour_base, edge_weight)].
+        adj: dict = {}
+        for u, v, d in sub.edges(data=True):
+            if d.get("weight") == float("inf"):
+                continue
+            bu, bv = u[:-2], v[:-2]
+            w = d.get("weight", 0.0)
+            adj.setdefault(bu, []).append((bv, w))
+            adj.setdefault(bv, []).append((bu, w))
+
+        # Label each contig: own significant chr, else best significant
+        # neighbour's chr (max weight, then lexicographic name), else a
+        # per-contig sentinel so isolated minors cannot bridge chromosomes.
+        label: dict = {}
+        for base in contig_chr:
+            ch = contig_chr[base]
+            if ch in significant:
+                label[base] = ch
+                continue
+            candidates = [(nbr, w) for nbr, w in adj.get(base, [])
+                          if contig_chr.get(nbr) in significant]
+            if candidates:
+                nbr = min(candidates, key=lambda x: (-x[1], x[0]))[0]
+                label[base] = contig_chr[nbr]
+            else:
+                label[base] = ("MINOR", base)
+
+        to_cut = []
+        for u, v, d in sub.edges(data=True):
+            if d.get("weight") == float("inf"):
+                continue
+            if label[u[:-2]] != label[v[:-2]]:
+                to_cut.append((u, v))
+        if to_cut:
+            cover.remove_edges_from(to_cut)
+            n_cut += len(to_cut)
+
+    return n_cut
+
+
 def _merge_scaffolds_on_cover(cover, contig_ref: dict,
                                contig_lengths: dict,
                                gap_min: int = 0) -> int:
