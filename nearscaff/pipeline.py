@@ -549,6 +549,16 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
         logger.info("  Pass (%s) result: %d scaffolds, %d contigs, %d gaps",
                     preset, n_scaf, n_seq, n_gap)
 
+    # ---- Enforce chromosome purity: sever cross-chromosome bridges ----
+    if config.scaffold.enforce_chr_purity:
+        logger.info("Stage 1b: Enforcing chromosome purity on cover graph ...")
+        n_cut = _enforce_chromosome_purity(
+            cover, contig_ref, contig_lengths,
+            min_share=config.scaffold.min_chr_share,
+            min_len=config.scaffold.min_chr_len,
+        )
+        logger.info("  %d cross-chromosome edges severed", n_cut)
+
     # ---- Final step: merge scaffolds by chromosome on cover graph ----
     logger.info("Stage 1c: Merging scaffolds by chromosome on cover graph ...")
     n_merged = _merge_scaffolds_on_cover(cover, contig_ref, contig_lengths,
