@@ -49,6 +49,15 @@ def main():
                        help="Do not build/reuse a minimap2 reference index")
     p_run.add_argument("--keep-intermediate", action="store_true",
                        help="Keep intermediate files")
+    p_run.add_argument("--no-chr-purity", action="store_true",
+                       help="Disable chromosome-purity enforcement (allow "
+                       "cross-chromosome scaffolds)")
+    p_run.add_argument("--min-chr-share", type=float, default=0.20,
+                       help="Min contig-length share for a chromosome to be "
+                       "split out of a chimera (default: 0.20)")
+    p_run.add_argument("--min-chr-len", type=int, default=1_000_000,
+                       help="Min total contig length (bp) for a chromosome "
+                       "to be split out of a chimera (default: 1000000)")
 
     # ---- subcommand: scaffold ----
     p_scaf = sub.add_parser("scaffold", help="Run Stage 1 only (nucleotide scaffolding from Block Tree)")
@@ -79,6 +88,15 @@ def main():
                         "(default: 5)")
     p_scaf.add_argument("--no-reuse-index", action="store_true",
                         help="Do not build/reuse a minimap2 reference index")
+    p_scaf.add_argument("--no-chr-purity", action="store_true",
+                        help="Disable chromosome-purity enforcement (allow "
+                        "cross-chromosome scaffolds)")
+    p_scaf.add_argument("--min-chr-share", type=float, default=0.20,
+                        help="Min contig-length share for a chromosome to be "
+                        "split out of a chimera (default: 0.20)")
+    p_scaf.add_argument("--min-chr-len", type=int, default=1_000_000,
+                        help="Min total contig length (bp) for a chromosome "
+                        "to be split out of a chimera (default: 1000000)")
 
     # ---- subcommand: kmer-phase ----
     p_kp = sub.add_parser(
@@ -337,6 +355,12 @@ def _build_config(args) -> NearscaffConfig:
         config.scaffold.best_buddy_scale = False
     if hasattr(args, "keep_unplaced"):
         config.scaffold.keep_unplaced = args.keep_unplaced
+    if hasattr(args, "no_chr_purity") and args.no_chr_purity:
+        config.scaffold.enforce_chr_purity = False
+    if hasattr(args, "min_chr_share"):
+        config.scaffold.min_chr_share = args.min_chr_share
+    if hasattr(args, "min_chr_len"):
+        config.scaffold.min_chr_len = args.min_chr_len
     if hasattr(args, "preset") and args.preset:
         preset = DIVERGENCE_PRESETS[args.preset]
         config.protein.splice_model = preset["miniprot_j"]
