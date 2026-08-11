@@ -595,11 +595,29 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
 
     # ---- Extract final AGP ----
     logger.info("Stage 1e: Writing final AGP ...")
-    agp_lines = _extract_agp_paths(cover, contig_lengths,
-                                   config.scaffold.unknown_gap_size,
-                                   contig_ref=contig_ref,
-                                   contig_strand=contig_strand,
-                                   contig_mapq=contig_mapq)
+    anchor_coords = _load_anchor_coords(os.path.join(output_dir, "gene_anchors.tsv"))
+    if anchor_coords:
+        logger.info("  Loaded protein-anchor coords for %d contigs", len(anchor_coords))
+    synt_report = []
+    agp_lines = _extract_agp_paths(
+        cover, contig_lengths,
+        config.scaffold.unknown_gap_size,
+        contig_ref=contig_ref,
+        contig_strand=contig_strand,
+        contig_mapq=contig_mapq,
+        anchor_coords=anchor_coords,
+        synteny_reorder=config.scaffold.synteny_reorder,
+        suspect_anchor_span=config.scaffold.suspect_anchor_span,
+        suspect_divergence=config.scaffold.suspect_divergence,
+        report=synt_report,
+    )
+    if synt_report:
+        rep_path = os.path.join(output_dir, "synteny_order_report.tsv")
+        with open(rep_path, "w", encoding="utf-8") as fh:
+            fh.write("scaffold\tn_contigs\tn_with_anchors\tn_relocated\tn_suspect\n")
+            for row in synt_report:
+                fh.write("\t".join(map(str, row)) + "\n")
+        logger.info("Synteny reorder report saved to %s", rep_path)
     if config.scaffold.keep_unplaced is not None:
         agp_lines = _append_unplaced_singletons(
             agp_lines, contig_lengths, config.scaffold.keep_unplaced)
