@@ -58,6 +58,14 @@ def main():
     p_run.add_argument("--min-chr-len", type=int, default=1_000_000,
                        help="Min total contig length (bp) for a chromosome "
                        "to be split out of a chimera (default: 1000000)")
+    p_run.add_argument("--no-synteny-reorder", action="store_true",
+                       help="Disable protein-anchor synteny reordering of contigs")
+    p_run.add_argument("--suspect-anchor-span", type=int, default=5_000_000,
+                       help="Contig protein-anchor span (bp) above which a contig "
+                       "is flagged assembly-suspect (default: 5000000)")
+    p_run.add_argument("--suspect-divergence", type=int, default=10_000_000,
+                       help="Protein-vs-nucleotide coordinate divergence (bp) above "
+                       "which a contig is flagged assembly-suspect (default: 10000000)")
 
     # ---- subcommand: scaffold ----
     p_scaf = sub.add_parser("scaffold", help="Run Stage 1 only (nucleotide scaffolding from Block Tree)")
@@ -97,6 +105,14 @@ def main():
     p_scaf.add_argument("--min-chr-len", type=int, default=1_000_000,
                         help="Min total contig length (bp) for a chromosome "
                         "to be split out of a chimera (default: 1000000)")
+    p_scaf.add_argument("--no-synteny-reorder", action="store_true",
+                        help="Disable protein-anchor synteny reordering of contigs")
+    p_scaf.add_argument("--suspect-anchor-span", type=int, default=5_000_000,
+                        help="Contig protein-anchor span (bp) above which a contig "
+                        "is flagged assembly-suspect (default: 5000000)")
+    p_scaf.add_argument("--suspect-divergence", type=int, default=10_000_000,
+                        help="Protein-vs-nucleotide coordinate divergence (bp) above "
+                        "which a contig is flagged assembly-suspect (default: 10000000)")
 
     # ---- subcommand: kmer-phase ----
     p_kp = sub.add_parser(
@@ -361,6 +377,12 @@ def _build_config(args) -> NearscaffConfig:
         config.scaffold.min_chr_share = args.min_chr_share
     if hasattr(args, "min_chr_len"):
         config.scaffold.min_chr_len = args.min_chr_len
+    if hasattr(args, "no_synteny_reorder") and args.no_synteny_reorder:
+        config.scaffold.synteny_reorder = False
+    if hasattr(args, "suspect_anchor_span"):
+        config.scaffold.suspect_anchor_span = args.suspect_anchor_span
+    if hasattr(args, "suspect_divergence"):
+        config.scaffold.suspect_divergence = args.suspect_divergence
     if hasattr(args, "preset") and args.preset:
         preset = DIVERGENCE_PRESETS[args.preset]
         config.protein.splice_model = preset["miniprot_j"]

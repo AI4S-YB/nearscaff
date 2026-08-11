@@ -161,3 +161,24 @@ def test_synteny_reorder_ignores_foreign_chromosome_anchors():
     assert _order_of(lines) == ["A", "X", "B"]
     # X did NOT count as having anchors (its only anchor is foreign-chr)
     assert report[0][2] == 2  # n_with_anchors = A and B only
+
+
+def test_build_config_synteny_reorder_defaults():
+    from argparse import Namespace
+    from nearscaff.cli import _build_config
+    cfg = _build_config(Namespace(threads=4, output="o"))
+    assert cfg.scaffold.synteny_reorder is True
+    assert cfg.scaffold.suspect_anchor_span == 5_000_000
+    assert cfg.scaffold.suspect_divergence == 10_000_000
+
+
+def test_build_config_no_synteny_reorder():
+    from argparse import Namespace
+    from nearscaff.cli import _build_config
+    cfg = _build_config(Namespace(threads=4, output="o",
+                                  no_synteny_reorder=True,
+                                  suspect_anchor_span=3_000_000,
+                                  suspect_divergence=7_000_000))
+    assert cfg.scaffold.synteny_reorder is False
+    assert cfg.scaffold.suspect_anchor_span == 3_000_000
+    assert cfg.scaffold.suspect_divergence == 7_000_000
