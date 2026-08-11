@@ -56,6 +56,9 @@ class ScaffoldConfig:
     enforce_chr_purity: bool = True     # 切断跨染色体的 cover-graph 桥边
     min_chr_share: float = 0.20         # significant chr 的最小长度占比
     min_chr_len: int = 1_000_000        # significant chr 的最小总长（bp）
+    synteny_reorder: bool = True            # 蛋白锚坐标优先排 contig
+    suspect_anchor_span: int = 5_000_000    # contig 锚跨度上限(>则 suspect)
+    suspect_divergence: int = 10_000_000    # 蛋白坐标 vs 核酸中点偏离上限
 
 
 @dataclass

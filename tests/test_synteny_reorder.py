@@ -2,6 +2,7 @@
 import os
 import tempfile
 
+from nearscaff.config import NearscaffConfig
 from nearscaff.pipeline import _write_anchors_tsv, _load_anchor_coords
 
 
@@ -43,3 +44,10 @@ def test_load_anchor_coords_degrades_on_old_format():
             fh.write("query_contig\tquery_gene\tref_chr\tref_gene\tstrand\tscore\tidentity\n")
             fh.write("ctg1\tg1\tchr1\tRG1\t+\t500\t0.9\n")
         assert _load_anchor_coords(path) == {}
+
+
+def test_scaffold_config_synteny_reorder_defaults():
+    cfg = NearscaffConfig()
+    assert cfg.scaffold.synteny_reorder is True
+    assert cfg.scaffold.suspect_anchor_span == 5_000_000
+    assert cfg.scaffold.suspect_divergence == 10_000_000
