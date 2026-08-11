@@ -1655,7 +1655,12 @@ def _extract_agp_paths(cover, contig_lengths: dict,
                        gap_max: int = 500000,
                        contig_ref: dict | None = None,
                        contig_strand: dict | None = None,
-                       contig_mapq: dict | None = None):
+                       contig_mapq: dict | None = None,
+                       anchor_coords: dict | None = None,
+                       synteny_reorder: bool = False,
+                       suspect_anchor_span: int = 5_000_000,
+                       suspect_divergence: int = 10_000_000,
+                       report: list | None = None):
     """Extract linear scaffold paths from cover graph into AGP lines.
 
     Each connected component in *cover* is a path (cycles already broken).
@@ -1678,6 +1683,7 @@ def _extract_agp_paths(cover, contig_lengths: dict,
     contig_ref = contig_ref or {}
     contig_strand = contig_strand or {}
     contig_mapq = contig_mapq or {}
+    anchor_coords = anchor_coords or {}
 
     lines = []
     scaffold_idx = 1
@@ -1718,33 +1724,63 @@ def _extract_agp_paths(cover, contig_lengths: dict,
             if base not in seen_bases:
                 seen_bases.append(base)
 
-        # Order by refined reference midpoint.  Contigs without coordinates
-        # keep graph order, interpolated between anchored neighbours so the
-        # scaffold runs in increasing reference coordinates.
+        scaf_name = f"nearscaff_{scaffold_idx:04d}"
+
+        # --- ordering coordinate: protein anchor (median) > nucleotide midpoint ---
+        from collections import Counter as _Counter
         mids = {b: (contig_ref[b][1] + contig_ref[b][2]) / 2
                 for b in seen_bases if b in contig_ref}
-        if len(mids) >= 2:
-            anchored_idx = [i for i, b in enumerate(seen_bases) if b in mids]
+        scaf_chr = None
+        if contig_ref:
+            _votes = _Counter(contig_ref[b][0] for b in seen_bases if b in contig_ref)
+            if _votes:
+                scaf_chr = _votes.most_common(1)[0][0]
+
+        suspect = set()
+        n_with_anchors = 0
+        coords = {}
+        for b in seen_bases:
+            prot = None
+            if synteny_reorder and scaf_chr and b in anchor_coords:
+                hits = [rs for (ch, rs, _st) in anchor_coords[b] if ch == scaf_chr]
+                if hits:
+                    n_with_anchors += 1
+                    hits_sorted = sorted(hits)
+                    prot = hits_sorted[len(hits_sorted) // 2]  # median
+                    if hits_sorted[-1] - hits_sorted[0] > suspect_anchor_span:
+                        suspect.add(b)
+            if prot is not None:
+                coords[b] = prot
+                if b in mids and abs(prot - mids[b]) > suspect_divergence:
+                    suspect.add(b)
+            elif b in mids:
+                coords[b] = mids[b]
+
+        relocated = 0
+        if len(coords) >= 2:
+            anchored_idx = [i for i, b in enumerate(seen_bases) if b in coords]
             est = []
             for i, b in enumerate(seen_bases):
-                if b in mids:
-                    est.append(mids[b])
+                if b in coords:
+                    est.append(coords[b])
                     continue
                 lo = max((j for j in anchored_idx if j < i), default=None)
                 hi = min((j for j in anchored_idx if j > i), default=None)
                 if lo is not None and hi is not None:
-                    m = (mids[seen_bases[lo]] + mids[seen_bases[hi]]) / 2
+                    m = (coords[seen_bases[lo]] + coords[seen_bases[hi]]) / 2
                 elif lo is not None:
-                    m = mids[seen_bases[lo]] - 0.5
+                    m = coords[seen_bases[lo]] - 0.5
                 else:
-                    m = mids[seen_bases[hi]] + 0.5
+                    m = coords[seen_bases[hi]] + 0.5
                 est.append(m)
-            # stable sort: ties (and interpolations) keep graph order
-            seen_bases = [b for _, b in sorted(zip(est, seen_bases),
-                                               key=lambda t: t[0])]
-        flip = False
+            new_order = [b for _, b in sorted(zip(est, seen_bases), key=lambda t: t[0])]
+            relocated = sum(1 for a, b in zip(seen_bases, new_order) if a != b)
+            seen_bases = new_order
 
-        scaf_name = f"nearscaff_{scaffold_idx:04d}"
+        if report is not None:
+            report.append((scaf_name, len(seen_bases), n_with_anchors, relocated, len(suspect)))
+
+        flip = False
         pos = 1
         part_num = 1
 
