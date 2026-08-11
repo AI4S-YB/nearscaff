@@ -72,7 +72,7 @@ def _order_of(agp_lines):
 
 def test_synteny_reorder_uses_protein_coordinate_over_noisy_midpoint():
     # protein coords: A=100, B=200, C=300 ; nucleotide midpoints (noisy): A=200,B=100,C=300
-    cover = _cover_path(["A", "B", "C"])
+    cover = _cover_path(["B", "A", "C"])  # graph/pre-sort order ≠ protein order → relocated>0
     lengths = {"A": 1000, "B": 1000, "C": 1000}
     contig_ref = {"A": ("chr1", 150, 250), "B": ("chr1", 50, 150), "C": ("chr1", 250, 350)}
     anchor_coords = {
