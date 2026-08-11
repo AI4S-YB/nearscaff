@@ -122,3 +122,42 @@ def test_synteny_reorder_disabled_matches_midpoint():
     lines = _extract_agp_paths(cover, lengths, contig_ref=contig_ref,
                                anchor_coords=anchor_coords, synteny_reorder=False, report=[])
     assert _order_of(lines) == ["A", "B", "C"]  # midpoint order (disabled)
+
+
+def test_synteny_reorder_flag_suspect_for_protein_midpoint_divergence():
+    # X has a single tight anchor (span 0, not suspect-by-span) at protein coord 100,
+    # but its nucleotide midpoint is 20Mb away -> suspect by divergence.
+    cover = _cover_path(["A", "X", "B"])
+    lengths = {"A": 1000, "X": 1000, "B": 1000}
+    contig_ref = {"A": ("chr1", 1, 100),
+                  "X": ("chr1", 20_000_100, 20_000_200),   # midpoint ~20_000_150
+                  "B": ("chr1", 40_000_000, 40_000_100)}
+    anchor_coords = {"A": [("chr1", 0, "+")],
+                     "X": [("chr1", 100, "+")],   # tight span; |100 - 20_000_150| > 10Mb
+                     "B": [("chr1", 40_000_050, "+")]}
+    report = []
+    _extract_agp_paths(cover, lengths, contig_ref=contig_ref,
+                       anchor_coords=anchor_coords, synteny_reorder=True,
+                       suspect_anchor_span=5_000_000, suspect_divergence=10_000_000,
+                       report=report)
+    assert report[0][4] == 1  # n_suspect: X flagged via divergence
+
+
+def test_synteny_reorder_ignores_foreign_chromosome_anchors():
+    # scaffold majority chr = chr1 (A,B,C all ref chr1). X has anchors ONLY on chr2.
+    # X must fall back to its chr1 nucleotide midpoint, not use chr2 protein coord.
+    cover = _cover_path(["A", "X", "B"])
+    lengths = {"A": 1000, "X": 1000, "B": 1000}
+    contig_ref = {"A": ("chr1", 1, 100), "X": ("chr1", 150, 250), "B": ("chr1", 300, 400)}
+    anchor_coords = {"A": [("chr1", 50, "+")],
+                     "X": [("chr2", 9_999_999, "+")],   # foreign chr -> ignored
+                     "B": [("chr1", 350, "+")]}
+    report = []
+    lines = _extract_agp_paths(cover, lengths, contig_ref=contig_ref,
+                               anchor_coords=anchor_coords, synteny_reorder=True,
+                               suspect_anchor_span=5_000_000, suspect_divergence=10_000_000,
+                               report=report)
+    # X placed by its chr1 midpoint (150-250 -> 200), between A(50) and B(350)
+    assert _order_of(lines) == ["A", "X", "B"]
+    # X did NOT count as having anchors (its only anchor is foreign-chr)
+    assert report[0][2] == 2  # n_with_anchors = A and B only

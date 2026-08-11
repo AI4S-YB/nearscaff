@@ -1649,6 +1649,34 @@ def _read_fasta_lengths(path: str) -> dict:
     return lengths
 
 
+def _sorted_by_coords(seen_bases: list, coord_map: dict) -> list:
+    """Stable-order *seen_bases* by reference coordinate in *coord_map*.
+
+    Contigs present in *coord_map* sort by their coordinate; contigs absent
+    keep graph order, interpolated between anchored neighbours so the result
+    runs in increasing coordinates.  Returns a new list (>=2 anchored contigs
+    required to sort; otherwise returns the input order unchanged).
+    """
+    if len(coord_map) < 2:
+        return list(seen_bases)
+    anchored_idx = [i for i, b in enumerate(seen_bases) if b in coord_map]
+    est = []
+    for i, b in enumerate(seen_bases):
+        if b in coord_map:
+            est.append(coord_map[b])
+            continue
+        lo = max((j for j in anchored_idx if j < i), default=None)
+        hi = min((j for j in anchored_idx if j > i), default=None)
+        if lo is not None and hi is not None:
+            m = (coord_map[seen_bases[lo]] + coord_map[seen_bases[hi]]) / 2
+        elif lo is not None:
+            m = coord_map[seen_bases[lo]] - 0.5
+        else:
+            m = coord_map[seen_bases[hi]] + 0.5
+        est.append(m)
+    return [b for _, b in sorted(zip(est, seen_bases), key=lambda t: t[0])]
+
+
 def _extract_agp_paths(cover, contig_lengths: dict,
                        unknown_gap_size: int = 100,
                        gap_min: int = 0,
@@ -1756,26 +1784,10 @@ def _extract_agp_paths(cover, contig_lengths: dict,
             elif b in mids:
                 coords[b] = mids[b]
 
-        relocated = 0
-        if len(coords) >= 2:
-            anchored_idx = [i for i, b in enumerate(seen_bases) if b in coords]
-            est = []
-            for i, b in enumerate(seen_bases):
-                if b in coords:
-                    est.append(coords[b])
-                    continue
-                lo = max((j for j in anchored_idx if j < i), default=None)
-                hi = min((j for j in anchored_idx if j > i), default=None)
-                if lo is not None and hi is not None:
-                    m = (coords[seen_bases[lo]] + coords[seen_bases[hi]]) / 2
-                elif lo is not None:
-                    m = coords[seen_bases[lo]] - 0.5
-                else:
-                    m = coords[seen_bases[hi]] + 0.5
-                est.append(m)
-            new_order = [b for _, b in sorted(zip(est, seen_bases), key=lambda t: t[0])]
-            relocated = sum(1 for a, b in zip(seen_bases, new_order) if a != b)
-            seen_bases = new_order
+        new_order = _sorted_by_coords(seen_bases, coords)
+        midpoint_order = _sorted_by_coords(seen_bases, mids)  # old (midpoint-only) behavior
+        relocated = sum(1 for a, b in zip(new_order, midpoint_order) if a != b)
+        seen_bases = new_order
 
         if report is not None:
             report.append((scaf_name, len(seen_bases), n_with_anchors, relocated, len(suspect)))
