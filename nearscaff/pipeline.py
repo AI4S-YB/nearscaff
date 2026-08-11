@@ -1582,10 +1582,42 @@ def _enrich_anchors(anchors: list, gene_locations: dict) -> list:
 
 def _write_anchors_tsv(anchors, path):
     with open(path, 'w') as f:
-        f.write("query_contig\tquery_gene\tref_chr\tref_gene\tstrand\tscore\tidentity\n")
+        f.write("query_contig\tquery_gene\tref_chr\tref_gene\t"
+                "ref_start\tref_end\tstrand\tscore\tidentity\n")
         for a in anchors:
             f.write(f"{a.query_contig}\t{a.query_gene}\t{a.ref_chr}\t"
-                    f"{a.ref_gene}\t{a.strand}\t{a.score}\t{a.identity}\n")
+                    f"{a.ref_gene}\t{a.r_start}\t{a.r_end}\t"
+                    f"{a.strand}\t{a.score}\t{a.identity}\n")
+
+
+def _load_anchor_coords(path: str) -> dict:
+    """Load persisted protein anchors into {contig: [(ref_chr, ref_start, strand)]}.
+
+    Returns {} when the file is missing or in the old 7-column format (no
+    ref_start/ref_end), so the caller degrades to nucleotide-midpoint ordering.
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    coords: dict = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+        try:
+            i_qc = header.index("query_contig")
+            i_chr = header.index("ref_chr")
+            i_rs = header.index("ref_start")
+            i_st = header.index("strand")
+        except ValueError:
+            return {}  # old format without coordinate columns
+        for line in fh:
+            p = line.rstrip("\n").split("\t")
+            if len(p) <= max(i_qc, i_chr, i_rs, i_st):
+                continue
+            try:
+                rs = int(p[i_rs])
+            except ValueError:
+                continue
+            coords.setdefault(p[i_qc], []).append((p[i_chr], rs, p[i_st]))
+    return coords
 
 
 def _write_blocks_file(blocks, path):
