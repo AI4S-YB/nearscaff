@@ -124,23 +124,24 @@ def test_synteny_reorder_disabled_matches_midpoint():
     assert _order_of(lines) == ["A", "B", "C"]  # midpoint order (disabled)
 
 
-def test_synteny_reorder_flag_suspect_for_protein_midpoint_divergence():
-    # X has a single tight anchor (span 0, not suspect-by-span) at protein coord 100,
-    # but its nucleotide midpoint is 20Mb away -> suspect by divergence.
-    cover = _cover_path(["A", "X", "B"])
-    lengths = {"A": 1000, "X": 1000, "B": 1000}
-    contig_ref = {"A": ("chr1", 1, 100),
-                  "X": ("chr1", 20_000_100, 20_000_200),   # midpoint ~20_000_150
-                  "B": ("chr1", 40_000_000, 40_000_100)}
-    anchor_coords = {"A": [("chr1", 0, "+")],
-                     "X": [("chr1", 100, "+")],   # tight span; |100 - 20_000_150| > 10Mb
-                     "B": [("chr1", 40_000_050, "+")]}
+def test_synteny_reorder_uses_anchor_chr_not_contig_ref_chr():
+    # Production scenario: anchors are in a DIFFERENT coordinate space
+    # (ref-protein chr "KAH7") than contig_ref (scaffolding chr "CM040171").
+    # The reorder must key off the ANCHOR chr (dominant = KAH7), not the
+    # contig_ref chr, or it silently no-ops (the original bug).
+    cover = _cover_path(["B", "A", "C"])  # graph order != protein order
+    lengths = {"A": 1000, "B": 1000, "C": 1000}
+    contig_ref = {"A": ("CM040171", 50, 150), "B": ("CM040171", 150, 250),
+                  "C": ("CM040171", 250, 350)}
+    anchor_coords = {"A": [("KAH7", 100, "+")], "B": [("KAH7", 200, "+")],
+                     "C": [("KAH7", 300, "+")]}  # KAH7 protein order A<B<C
     report = []
-    _extract_agp_paths(cover, lengths, contig_ref=contig_ref,
-                       anchor_coords=anchor_coords, synteny_reorder=True,
-                       suspect_anchor_span=5_000_000, suspect_divergence=10_000_000,
-                       report=report)
-    assert report[0][4] == 1  # n_suspect: X flagged via divergence
+    lines = _extract_agp_paths(cover, lengths, contig_ref=contig_ref,
+                               anchor_coords=anchor_coords, synteny_reorder=True,
+                               suspect_anchor_span=5_000_000, suspect_divergence=10_000_000,
+                               report=report)
+    assert _order_of(lines) == ["A", "B", "C"]  # ordered by KAH7 protein coords
+    assert report[0][2] == 3  # n_with_anchors: all 3 matched (anchor chr KAH7)
 
 
 def test_synteny_reorder_ignores_foreign_chromosome_anchors():

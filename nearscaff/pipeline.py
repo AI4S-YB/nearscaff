@@ -336,7 +336,9 @@ def _run_signal_c_protein(
     logger.info("  %d anchors updated with real reference coordinates",
                 sum(1 for a in anchors if a.query_contig in contig_ref_pos))
 
-    if config.keep_intermediate:
+    if config.keep_intermediate or config.scaffold.synteny_reorder:
+        # gene_anchors.tsv is a REQUIRED input for Stage 1e synteny reorder
+        # (not just a debug artifact), so write it whenever reorder is enabled.
         _write_anchors_tsv(anchors, os.path.join(output_dir, "gene_anchors.tsv"))
 
     logger.info("Signal C: C-score filtering (threshold=%.2f) ...",
@@ -1776,29 +1778,37 @@ def _extract_agp_paths(cover, contig_lengths: dict,
         from collections import Counter as _Counter
         mids = {b: (contig_ref[b][1] + contig_ref[b][2]) / 2
                 for b in seen_bases if b in contig_ref}
-        scaf_chr = None
-        if contig_ref:
-            _votes = _Counter(contig_ref[b][0] for b in seen_bases if b in contig_ref)
-            if _votes:
-                scaf_chr = _votes.most_common(1)[0][0]
+        # Dominant ANCHOR (ref-protein) chromosome for this scaffold — the
+        # synteny counterpart.  NOT contig_ref's chromosome: anchors live in
+        # the protein-reference coordinate space (e.g. V. darrowii), contig_ref
+        # in the scaffolding-reference space (e.g. V. macrocarpon) — different
+        # species for cross-species proteins, so the old `ch == scaf_chr`
+        # (contig_ref chr) filter never matched and the reorder was a no-op.
+        scaf_anchor_chr = None
+        if anchor_coords:
+            _achr_votes = _Counter()
+            for b in seen_bases:
+                for (ch, _rs, _st) in anchor_coords.get(b, []):
+                    _achr_votes[ch] += 1
+            if _achr_votes:
+                scaf_anchor_chr = _achr_votes.most_common(1)[0][0]
 
         suspect = set()
         n_with_anchors = 0
         coords = {}
         for b in seen_bases:
             prot = None
-            if synteny_reorder and scaf_chr and b in anchor_coords:
-                hits = [rs for (ch, rs, _st) in anchor_coords[b] if ch == scaf_chr]
+            if synteny_reorder and scaf_anchor_chr and b in anchor_coords:
+                hits = [rs for (ch, rs, _st) in anchor_coords[b]
+                        if ch == scaf_anchor_chr]
                 if hits:
                     n_with_anchors += 1
                     hits_sorted = sorted(hits)
                     prot = hits_sorted[len(hits_sorted) // 2]  # median
                     if hits_sorted[-1] - hits_sorted[0] > suspect_anchor_span:
-                        suspect.add(b)
+                        suspect.add(b)            # internally inconsistent anchors
             if prot is not None:
                 coords[b] = prot
-                if b in mids and abs(prot - mids[b]) > suspect_divergence:
-                    suspect.add(b)
             elif b in mids:
                 coords[b] = mids[b]
 
