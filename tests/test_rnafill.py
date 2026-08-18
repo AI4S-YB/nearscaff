@@ -410,3 +410,326 @@ def test_extract_read_pairs(tmp_path):
     assert open(o1).read().count("@") == 2
     assert "@r2" not in open(o1).read()
     assert "@r3" in open(o2).read()
+
+
+# ---- ref-guided whole-gene placement -----------------------------------------
+
+import random  # noqa: E402
+import shutil  # noqa: E402
+
+import pytest  # noqa: E402
+
+from nearscaff.rnafill import (  # noqa: E402
+    read_ref_genes, contig_ref_index, gap_ref_brackets,
+    assign_tx_to_genes, build_gene_placement, plan_placements,
+    run_rnafill)
+
+HAS_MINIMAP2 = shutil.which("minimap2") is not None
+
+
+def _refgenes_text():
+    return ("chrR\tsrc\tmRNA\t2001\t2400\t.\t+\t.\tID=g1\n"
+            "chrR\tsrc\tmRNA\t6001\t6500\t.\t-\t.\tID=g2\n")
+
+
+def test_read_ref_genes_mrna_and_fallback(tmp_path):
+    gff = _write(tmp_path, "r.gff", _refgenes_text())
+    genes = read_ref_genes(gff)
+    assert genes == {"chrR": [(2000, 2400, "g1", "+"),
+                              (6000, 6500, "g2", "-")]}
+    # no mRNA lines -> fall back to gene lines
+    gff2 = _write(tmp_path, "r2.gff",
+                  "chrR\tsrc\tgene\t101\t200\t.\t+\t.\tID=gx\n")
+    assert read_ref_genes(gff2) == {"chrR": [(100, 200, "gx", "+")]}
+
+
+def _tiered_paf(tmp_path, lines):
+    return _write(tmp_path, "tiered.paf", "\n".join(lines) + "\n")
+
+
+def test_contig_ref_index_and_brackets(tmp_path):
+    # cA -> chrR [10000,15000) '+', cB -> chrR [15700,20700) '+'
+    paf = _tiered_paf(tmp_path, [
+        "cA\t5000\t0\t5000\t+\tchrR\t30000\t10000\t15000\t5000\t5000\t60"
+        "\ttp:A:P\tnc:Z:protein",
+        "cB\t5000\t0\t5000\t+\tchrR\t30000\t15700\t20700\t5000\t5000\t60"
+        "\ttp:A:P\tnc:Z:protein",
+    ])
+    idx = contig_ref_index(paf)
+    assert idx["cA"][0][:6] == (0, 5000, "+", "chrR", 10000, 15000)
+    agp_lines = AGPReader().parse(
+        "s1\t1\t5000\t1\tW\tcA\t1\t5000\t+\n"
+        "s1\t5001\t5100\t2\tU\t100\tscaffold\tyes\tna\n"
+        "s1\t5101\t10100\t3\tW\tcB\t1\t5000\t+\n")
+    br = gap_ref_brackets(agp_lines, {1}, idx)
+    assert br == {1: ("chrR", 14999, 15700, False)}
+
+
+def test_gap_ref_brackets_minus_strand(tmp_path):
+    # both flanks on '-' strand: bracket identical, flip=True
+    paf = _tiered_paf(tmp_path, [
+        "cA\t5000\t0\t5000\t-\tchrR\t30000\t10000\t15000\t5000\t5000\t60"
+        "\ttp:A:P",
+        "cB\t5000\t0\t5000\t-\tchrR\t30000\t15700\t20700\t5000\t5000\t60"
+        "\ttp:A:P",
+    ])
+    idx = contig_ref_index(paf)
+    agp_lines = AGPReader().parse(
+        "s1\t1\t5000\t1\tW\tcA\t1\t5000\t-\n"
+        "s1\t5001\t5100\t2\tU\t100\tscaffold\tyes\tna\n"
+        "s1\t5101\t10100\t3\tW\tcB\t1\t5000\t-\n")
+    br = gap_ref_brackets(agp_lines, {1}, idx)
+    assert br == {1: ("chrR", 14999, 15700, True)}
+
+
+def test_gap_ref_brackets_rejects(tmp_path):
+    agp_lines = AGPReader().parse(
+        "s1\t1\t5000\t1\tW\tcA\t1\t5000\t+\n"
+        "s1\t5001\t5100\t2\tU\t100\tscaffold\tyes\tna\n"
+        "s1\t5101\t10100\t3\tW\tcB\t1\t5000\t+\n")
+    # different chromosomes -> no bracket
+    paf = _tiered_paf(tmp_path, [
+        "cA\t5000\t0\t5000\t+\tchrR\t30000\t10000\t15000\t5000\t5000\t60"
+        "\ttp:A:P",
+        "cB\t5000\t0\t5000\t+\tchrX\t30000\t15700\t20700\t5000\t5000\t60"
+        "\ttp:A:P",
+    ])
+    assert gap_ref_brackets(agp_lines, {1}, contig_ref_index(paf)) == {}
+    # bracket too large -> no bracket
+    paf2 = _tiered_paf(tmp_path, [
+        "cA\t5000\t0\t5000\t+\tchrR\t9000000\t10000\t15000\t5000\t5000\t60"
+        "\ttp:A:P",
+        "cB\t5000\t0\t5000\t+\tchrR\t9000000\t15700\t20700\t5000\t5000\t60"
+        "\ttp:A:P",
+    ])
+    assert gap_ref_brackets(agp_lines, {1}, contig_ref_index(paf2),
+                            max_bracket=500) == {}
+    # secondary alignment used when no primary covers the coordinate
+    paf3 = _tiered_paf(tmp_path, [
+        "cA\t5000\t0\t5000\t+\tchrR\t30000\t10000\t15000\t5000\t5000\t60"
+        "\ttp:A:S",
+        "cB\t5000\t0\t5000\t+\tchrR\t30000\t15700\t20700\t5000\t5000\t60"
+        "\ttp:A:S",
+    ])
+    br = gap_ref_brackets(agp_lines, {1}, contig_ref_index(paf3))
+    assert br == {1: ("chrR", 14999, 15700, False)}
+
+
+def _tx_paf_fields(ts, te, cg, strand="+", qlen=300, qs=0, qe=300,
+                   tx="tx"):
+    return [tx, str(qlen), str(qs), str(qe), strand, "chrR", "30000",
+            str(ts), str(te), str(qe - qs), str(te - ts), "60",
+            "tp:A:P", f"cg:Z:{cg}"]
+
+
+def test_build_gene_placement_plus(tmp_path):
+    tx = "A" * 100 + "C" * 200
+    p = _tx_paf_fields(1000, 1350, "100M50N200M")
+    blocks = build_gene_placement(tx, p, 900, 2000)
+    # unclipped intron gets the canonical splice consensus on its edges
+    assert blocks == ["A" * 100, "GT" + "N" * 46 + "AG", "C" * 200]
+
+
+def test_build_gene_placement_clipped_to_bracket():
+    tx = "A" * 100 + "C" * 200
+    p = _tx_paf_fields(1000, 1350, "100M50N200M")
+    # bracket cuts 49 bp off exon1's head and 150 bp off exon2's tail;
+    # the intron itself is unclipped -> splice edges stamped
+    blocks = build_gene_placement(tx, p, 1049, 1200)
+    assert blocks == ["A" * 51, "GT" + "N" * 46 + "AG", "C" * 50]
+    # bracket cuts THROUGH the intron -> plain estimated-N spacer tuple
+    blocks = build_gene_placement(tx, p, 1049, 1130)
+    assert blocks == ["A" * 51, (None, 30)]
+    # no exonic base inside the bracket -> empty
+    assert build_gene_placement(tx, p, 500, 900) == []
+
+
+def test_build_gene_placement_small_intron_merged():
+    tx = "A" * 100 + "C" * 100
+    p = _tx_paf_fields(1000, 1210, "100M10N100M", qlen=200, qe=200)
+    # 10 bp intron < min_spacer -> exons stay joined
+    blocks = build_gene_placement(tx, p, 900, 2000)
+    assert blocks == ["A" * 100 + "C" * 100]
+
+
+def test_build_gene_placement_minus_strand():
+    # '-' CIGAR walks the query backward from qe; chunks are revcomped
+    # individually and CIGAR order is already ref-forward.
+    e1 = "ACGT" * 25                      # 100 bp
+    e2 = "TGCA" * 50                      # 200 bp
+    tx = _revcomp(e1 + e2)                # revcomp: e2' then e1'
+    p = _tx_paf_fields(1000, 1350, "100M50N200M", strand="-")
+    blocks = build_gene_placement(tx, p, 900, 2000)
+    # minus-strand gene: intron placeholder carries CT..AC (revcomp
+    # of GT..AG)
+    assert blocks == [e1, "CT" + "N" * 46 + "AC", e2]
+
+
+def test_assign_tx_to_genes(tmp_path):
+    ref_genes = {"chrR": [(1000, 1400, "g1", "+"), (5000, 5400, "g2", "+")]}
+    lines = [
+        # full overlap, primary -> assigned to g1
+        "txA\t400\t0\t400\t+\tchrR\t30000\t1000\t1400\t400\t400\t60"
+        "\ttp:A:P\tcg:Z:400M",
+        # secondary -> ignored
+        "txB\t400\t0\t400\t+\tchrR\t30000\t1000\t1400\t400\t400\t60"
+        "\ttp:A:S\tcg:Z:400M",
+        # partial overlap (200/400 = 0.5, passes) but loses g1 to txA
+        "txC\t400\t0\t400\t+\tchrR\t30000\t1200\t1600\t400\t400\t60"
+        "\ttp:A:P\tcg:Z:400M",
+        # overlap too small (<0.5 of both gene and alignment) -> none
+        "txD\t600\t0\t600\t+\tchrR\t30000\t5300\t5900\t600\t600\t60"
+        "\ttp:A:P\tcg:Z:600M",
+    ]
+    paf = _paf(tmp_path, lines)
+    got = assign_tx_to_genes(paf, ref_genes)
+    assert set(got) == {"g1"}
+    assert got["g1"][0] == "txA"
+
+
+def test_plan_placements_multi_gene():
+    brackets = {1: ("chrR", 1000, 9000, False)}
+    ref_genes = {"chrR": [(2000, 2400, "g1", "+"), (6000, 6500, "g2", "+"),
+                          (7000, 7100, "g3", "+")]}  # g3: no transcript
+    gene_tx = {"g1": ("tx1", _tx_paf_fields(2000, 2400, "400M",
+                                            qlen=400, qe=400, tx="tx1")),
+               "g2": ("tx2", _tx_paf_fields(6000, 6500, "500M",
+                                            qlen=500, qe=500, tx="tx2"))}
+    tx_seqs = {"tx1": "A" * 400, "tx2": "C" * 500}
+    pl, detail = plan_placements(brackets, ref_genes, gene_tx, tx_seqs)
+    assert pl[1] == [(None, 1000), "A" * 400, (None, 3600),
+                     "C" * 500, (None, 2500)]
+    assert detail[1] == [("g1", "tx1", 400), ("g2", "tx2", 500)]
+
+
+def test_plan_placements_flip():
+    brackets = {1: ("chrR", 1000, 9000, True)}
+    ref_genes = {"chrR": [(2000, 2400, "g1", "+"), (6000, 6500, "g2", "+")]}
+    gene_tx = {"g1": ("tx1", _tx_paf_fields(2000, 2400, "400M",
+                                            qlen=400, qe=400, tx="tx1")),
+               "g2": ("tx2", _tx_paf_fields(6000, 6500, "500M",
+                                            qlen=500, qe=500, tx="tx2"))}
+    tx_seqs = {"tx1": "A" * 400, "tx2": "C" * 500}
+    pl, _d = plan_placements(brackets, ref_genes, gene_tx, tx_seqs)
+    # scaffold-forward = reversed ref order, sequences revcomped
+    assert pl[1] == [(None, 2500), "G" * 500, (None, 3600),
+                     "T" * 400, (None, 1000)]
+
+
+def test_plan_placements_max_genes():
+    brackets = {1: ("chrR", 1000, 9000, False)}
+    ref_genes = {"chrR": [(2000, 2400, "g1", "+"), (3000, 3400, "g2", "+"),
+                          (4000, 4400, "g3", "+")]}
+    gene_tx = {g: (f"tx{g[-1]}", _tx_paf_fields(b, e, "400M",
+                                                qlen=400, qe=400,
+                                                tx=f"tx{g[-1]}"))
+               for g, (b, e) in
+               {"g1": (2000, 2400), "g2": (3000, 3400),
+                "g3": (4000, 4400)}.items()}
+    tx_seqs = {f"tx{i}": "A" * 400 for i in "123"}
+    pl, detail = plan_placements(brackets, ref_genes, gene_tx, tx_seqs,
+                                 max_genes=2)
+    assert pl == {} and detail == {}
+
+
+def test_write_outputs_placements(tmp_path):
+    """Ref-guided placement: gap replaced by exon components + estimated-N
+    spacer rows; placements win over extensions; parts stay consecutive."""
+    contigs = {"c1": "AAAAACGT", "c2": "CCCCGGGG"}
+    agp_text = "\n".join([
+        "s1\t1\t8\t1\tW\tc1\t1\t8\t+",
+        "s1\t9\t108\t2\tU\t100\tscaffold\tyes\tna",
+        "s1\t109\t116\t3\tW\tc2\t1\t8\t+",
+    ]) + "\n"
+    agp_lines = AGPReader().parse(agp_text)
+    out_agp = str(tmp_path / "o.agp")
+    out_fa = str(tmp_path / "o.fa")
+    report = write_outputs(
+        agp_lines, {1}, {}, contigs, out_agp, out_fa,
+        extensions={1: ("LLL", "RRR")},          # must lose to placements
+        placements={1: ["AAA", (None, 50), "CCC"]})
+    assert report["gaps_placed"] == 1
+    assert report["gaps_extended"] == 0
+    assert report["bases_filled"] == 6
+    lines = AGPReader().parse(open(out_agp).read())
+    assert [l.part_number for l in lines] == list(range(1, len(lines) + 1))
+    w = [l for l in lines if isinstance(l, AGPSeqLine)]
+    g = [l for l in lines if isinstance(l, AGPGapLine)]
+    assert len(w) == 4 and len(g) == 1      # c1, AAA, gap, CCC, c2
+    assert g[0].gap_length == 50 and g[0].linkage == "no"
+    assert (w[1].object_beg, w[1].object_end) == (9, 11)
+    assert (g[0].object_beg, g[0].object_end) == (12, 61)
+    assert (w[2].object_beg, w[2].object_end) == (62, 64)
+    assert (w[3].object_beg, w[3].object_end) == (65, 72)
+    from nearscaff.gapfill import read_fasta as _rf
+    fa = _rf(out_fa)
+    assert fa == {"s1": "AAAAACGT" + "AAA" + "N" * 50 + "CCC" + "CCCCGGGG"}
+
+
+@pytest.mark.skipif(not HAS_MINIMAP2, reason="minimap2 not installed")
+def test_run_rnafill_ref_guided_end_to_end(tmp_path):
+    """Synthetic locus: a gene whose region is entirely a gap in the query
+    gets placed from ref coordinates, exons written, intron as N."""
+    rng = random.Random(7)
+    ref = "".join(rng.choice("ACGT") for _ in range(30000))
+    # gene g1 on chrR: exons [15000,15200) + [15350,15700), intron 150 bp
+    e1, e2 = ref[15000:15200], ref[15350:15700]
+    tx = e1 + e2
+    # query: cA = ref[10000:15000), cB = ref[15700:20700), gap in between
+    query_fa = _write(tmp_path, "q.fa",
+                      f">cA\n{ref[10000:15000]}\n>cB\n{ref[15700:20700]}\n")
+    ref_fa = _write(tmp_path, "ref.fa", f">chrR\n{ref}\n")
+    tx_fa = _write(tmp_path, "tx.fa", f">txG\n{tx}\n")
+    gff = _write(tmp_path, "ref.gff",
+                 "chrR\tsrc\tmRNA\t15001\t15700\t.\t+\t.\tID=g1\n")
+    agp = _write(tmp_path, "in.agp",
+                 "s1\t1\t5000\t1\tW\tcA\t1\t5000\t+\n"
+                 "s1\t5001\t5100\t2\tU\t100\tscaffold\tyes\tna\n"
+                 "s1\t5101\t10100\t3\tW\tcB\t1\t5000\t+\n")
+    tiered = _tiered_paf(tmp_path, [
+        f"cA\t5000\t0\t5000\t+\tchrR\t30000\t10000\t15000\t5000\t5000\t60"
+        "\ttp:A:P\tnc:Z:protein",
+        f"cB\t5000\t0\t5000\t+\tchrR\t30000\t15700\t20700\t5000\t5000\t60"
+        "\ttp:A:P\tnc:Z:protein",
+    ])
+    report = run_rnafill(agp, query_fa, tiered, str(tmp_path / "out"),
+                         transcripts=[tx_fa], ref=ref_fa, ref_gff=gff,
+                         overlap_closure=False)
+    assert report["genes_placed"] == 1
+    assert report["gaps_placed"] == 1
+    from nearscaff.gapfill import read_fasta as _rf
+    fa = _rf(str(tmp_path / "out" / "nearscaff.rnafill.scaffolds.fa"))
+    scaf = fa["s1"]
+    # exons (allowing a few bp of alignment fuzz at the edges) are in,
+    # in scaffold-forward order, separated by an N run
+    i1 = scaf.find(e1[5:-5])
+    i2 = scaf.find(e2[5:-5])
+    assert 5000 < i1 < i2
+    between = scaf[i1 + len(e1[5:-5]):i2]
+    assert set(between) <= {"N"} or "N" * 50 in between
+    # closures manifest records the placement
+    manifest = open(tmp_path / "out" / "rnafill.closures.tsv").read()
+    assert "placed:g1" in manifest and "txG" in manifest
+
+
+def test_find_intact_proteins(tmp_path):
+    """Intact = aligned coverage >= min_cov AND translation without X."""
+    from nearscaff.rnafill import find_intact_proteins
+    trans = _write(tmp_path, "t.faa", "\n".join([
+        # intact: cov 0.95, no X
+        "P1\t100\t0\t95\t+\ts1\t1000\t0\t300\t95\t95\t60",
+        "##STA\t" + "M" * 95,
+        # X-containing: full cov but crosses an N run
+        "P2\t100\t0\t100\t+\ts1\t1000\t400\t700\t100\t100\t60",
+        "##STA\t" + "M" * 50 + "XX" + "M" * 48,
+        # truncated: cov 0.5, no X
+        "P3\t100\t0\t50\t+\ts1\t1000\t800\t950\t50\t50\t60",
+        "##STA\t" + "M" * 50,
+        # two hits: one truncated with X, one intact -> intact
+        "P4\t100\t0\t60\t+\ts1\t1000\t0\t180\t60\t60\t60",
+        "##STA\t" + "M" * 58 + "XX",
+        "P4\t100\t5\t100\t-\ts2\t1000\t0\t285\t95\t95\t60",
+        "##STA\t" + "M" * 95,
+    ]) + "\n")
+    assert find_intact_proteins(trans) == {"P1", "P4"}
+    assert find_intact_proteins(trans, min_cov=0.4) == {"P1", "P3", "P4"}

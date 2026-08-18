@@ -175,6 +175,23 @@ nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
 `--fill-mode exon-only` 下则保持开放。exon-only 还会跳过边缘
 带有经典剪接位点（任一链上的 GT..AG）的 gap。
 
+**参考位置引导的整基因放置。** 整个位点全是 N 的基因没有 flank 可供
+转录本锚定，靠 flank 的填充永远无法恢复它——但转录组往往能把
+这个基因完整组装出来。加 `--ref REF.fa` 后，rna-fill 对所有其他
+机制都填不了的 gap 再做一遍放置：通过两翼 contig 的比对把 gap 括到
+参考基因组上（bracket），落在括号内的参考基因与转录本（比对到参考）
+匹配后，按参考顺序写进 gap——外显子为真实序列，内含子/基因间用
+估计长度的 N 串占位（长度取自参考并截断封顶）。基因坐标来自
+`--ref-gff`（若提供），否则用 miniprot 把 `--proteins` 贴回参考
+基因组推导：
+
+```bash
+nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
+    -T assembled.fa -o OUT_rnafill -t 16 \
+    --internal-n 20 --fill-mode exon-only --one-sided \
+    --ref REF.fa --proteins REF.pep.fa   # 或：--ref-gff REF.gff3
+```
+
 选项：`--fill-mode {cdna,exon-only}`；`--tx-preset`（默认
 `splice:hq`，噪声大的 cDNA 用 `splice`）；`--tx-min-span INT`；
 `--abut-window INT`（默认 30）；`--max-depth-factor FLOAT`（拒绝
@@ -183,7 +200,11 @@ nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
 `--one-sided`（单侧延伸：转录本盖住一侧边缘并伸进 gap ≥500 bp 时
 贴着该侧写出已知序列，残余 gap 保留）；`--internal-n LEN`（同时填充
 组件内部 ≥LEN bp 的 N 串——短读组装的 scaffold 内部有大量估计长度的
-N，HiFi 组装没有，默认 0 关闭）。
+N，HiFi 组装没有，默认 0 关闭）；`--ref REF.fa` + `--ref-gff GFF3` /
+`--proteins`（参考位置引导的整基因放置；`--place-max-bracket`
+默认 1 Mb，`--place-max-genes` 默认 50，`--place-min-ovlp`
+默认 0.5；`--place-intact-cov` 默认 0.8——蛋白在 query 中已有
+完整命中（无 X）的参考基因不重复放置，防旁系/挂载错位造重复）。
 需要 `PATH` 上有 `minimap2`。
 
 输出：`nearscaff.rnafill.agp` 和 `nearscaff.rnafill.scaffolds.fa`

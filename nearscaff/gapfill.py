@@ -105,7 +105,8 @@ def write_outputs(agp_lines: list, eligible: set, fills: dict,
                   pe_resize: dict | None = None,
                   trims: dict | None = None,
                   fill_prefix: str = "gapfill",
-                  extensions: dict | None = None) -> dict:
+                  extensions: dict | None = None,
+                  placements: dict | None = None) -> dict:
     """Write the gap-filled AGP + scaffold FASTA; return the report dict.
 
     *fills* is {agp_idx: fill_or_None}; gaps with a non-None fill are
@@ -120,6 +121,13 @@ def write_outputs(agp_lines: list, eligible: set, fills: dict,
     adjacent to the flank(s) (left_seq hugs the left flank, right_seq
     hugs the right flank), with the residual gap (original length,
     placeholder) in between.
+    *placements* is {agp_idx: [block, ...]}: ref-guided placements —
+    the gap line is replaced by an ordered list of blocks, each either
+    a sequence string (written as a W component, e.g. transcript exons)
+    or a (None, est_len) tuple (estimated-N gap row of length est_len:
+    intron/intergenic spacer, linkage "no").  Priority when several
+    mechanisms target the same gap: fills > placements > extensions >
+    pe_resize.
     All other lines pass through unchanged (coordinates and part numbers
     are re-numbered consistently).
     """
@@ -129,6 +137,7 @@ def write_outputs(agp_lines: list, eligible: set, fills: dict,
     pe_resize = pe_resize or {}
     trims = trims or {}
     extensions = extensions or {}
+    placements = placements or {}
     # preceding component index -> bp to trim off its 3' end
     trim_before: dict[int, int] = {}
     for gidx, ov in trims.items():
@@ -148,6 +157,8 @@ def write_outputs(agp_lines: list, eligible: set, fills: dict,
     n_resized = 0
     n_endjoin = 0
     n_extended = 0
+    n_ext_applied = 0
+    n_placed = 0
 
     for idx, line in enumerate(agp_lines):
         if line.object_name != cur:
@@ -175,7 +186,29 @@ def write_outputs(agp_lines: list, eligible: set, fills: dict,
             n_closed += 1
             bases_filled += len(seq)
         elif isinstance(line, AGPGapLine):
-            if idx in extensions:
+            if idx in placements:
+                blocks = placements[idx]
+                n_placed += 1
+                for bi, item in enumerate(blocks):
+                    if bi > 0:
+                        part += 1
+                    if isinstance(item, tuple):
+                        est = item[1]
+                        new_lines.append(AGPGapLine(
+                            cur, pos, pos + est - 1, part,
+                            "N", est, line.gap_type, "no", "na"))
+                        pos += est
+                    else:
+                        bseq = item
+                        fill_id = f"{cur}_{fill_prefix}{part}"
+                        fill_seqs[fill_id] = bseq
+                        new_lines.append(AGPSeqLine(
+                            cur, pos, pos + len(bseq) - 1, part,
+                            "W", fill_id, 1, len(bseq), "+"))
+                        pos += len(bseq)
+                        bases_filled += len(bseq)
+            elif idx in extensions:
+                n_ext_applied += 1
                 lseq, rseq = extensions[idx]
                 if lseq:
                     part_l = part
@@ -259,7 +292,8 @@ def write_outputs(agp_lines: list, eligible: set, fills: dict,
         "gaps_closed": n_closed,
         "gaps_resized": n_resized,
         "gaps_endjoined": n_endjoin,
-        "gaps_extended": len(extensions),
+        "gaps_extended": n_ext_applied,
+        "gaps_placed": n_placed,
         "bases_filled": bases_filled,
     }
     return report

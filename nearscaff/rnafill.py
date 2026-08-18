@@ -45,6 +45,26 @@ Fills are cDNA sequence by construction: in ``cdna`` mode the inserted
 sequence is real exonic sequence but intron content inside the gap is
 lost.  Use the output for annotation completeness, not for analyses
 that need true intronic sequence.
+
+Ref-guided whole-gene placement (``--ref``):
+  Gaps still unfilled after every flank-based mechanism get one more
+  pass.  The gap is bracketed on the reference genome through its
+  flanking contigs' tiered-PAF alignments; reference genes lying fully
+  inside the bracket are necessarily missing from the query (the region
+  is all N), so transcripts assigned to them (by mapping the
+  transcripts against the reference) are written into the gap in
+  reference order: exon components of real transcript sequence
+  separated by intron/intergenic spacers whose lengths come from the
+  reference (clamped).  Intron placeholders carry the canonical splice
+  consensus at their edges (GT..AG / CT..AC by strand — splicing is
+  proven by the transcript's CIGAR, only the intronic bases are
+  unknown), so miniprot and ab initio annotators can splice across
+  them; intergenic and bracket-edge spacers are plain N gap rows.  Gene coordinates come from ``--ref-gff``
+  when given, else from miniprot mapping ``--proteins`` back onto the
+  reference.  Unlike cdna fills, placed genes keep their intron
+  structure as N placeholders, so ab initio annotation is not distorted
+  — but the intronic sequence itself is unknown, only estimated in
+  length.
 """
 import logging
 import os
@@ -66,6 +86,15 @@ TX_MIN_OVLP = 300
 TX_MIN_OVLP_IDENT = 0.85
 TX_MIN_EXT = 500        # one-sided extension: min tail into the gap
 TX_MAX_EXT = 20000      # ... capped at this length (deep end truncated)
+
+PLACE_MIN_SPACER = 20   # ref-derived intron spacer: min estimated length
+PLACE_MAX_SPACER = 50000  # ... capped (ref distances are only estimates)
+PLACE_MIN_EDGE = 50     # bracket-edge/intergenic spacers: min length
+PLACE_MAX_BRACKET = 1_000_000
+PLACE_MAX_GENES = 50
+PLACE_MIN_OVLP = 0.5
+PLACE_INTACT_COV = 0.8  # proteins with an intact query hit (cov >= this,
+                        # no X) are not placed again (anti-duplication)
 
 
 _N_RUN = re.compile(r"[Nn]+")
@@ -231,21 +260,12 @@ def extract_read_pairs(paf_path: str, fq_files: list, out_files: list) -> int:
     return len(wanted)
 
 
-def run_recruit(agp_lines: list, contig_seqs: dict, scaf_seqs: dict,
-                eligible: set, output_dir: str, reads: list,
-                proteins: str, flank: int = TX_FLANK, bait_pad: int = 2000,
-                threads: int = 4, minimap2: str = "minimap2",
-                miniprot: str = "miniprot") -> dict:
-    """Read-recruitment phase: combined bait of gap flanks + broken-gene
-    loci, then extract the recruited read pairs for targeted assembly.
-
-    Writes ``rnafill.recruit_1/2.fastq`` (or .fastq + .fastq for SE) plus
-    the bait reference and intermediate miniprot outputs into
-    *output_dir*.  Returns a stats dict.
-    """
+def _ensure_query_miniprot(scaf_seqs: dict, proteins: str,
+                           output_dir: str, miniprot: str = "miniprot",
+                           threads: int = 4) -> tuple:
+    """miniprot proteins -> scaffolds (--gff + --trans), cached in
+    *output_dir*; returns (gff_path, trans_path)."""
     import subprocess
-
-    # scaffold fasta for miniprot + bait slicing
     scaf_fa = os.path.join(output_dir, "rnafill.scaffolds.fa")
     if not os.path.exists(scaf_fa):
         _write_records_fa([(n, s) for n, s in scaf_seqs.items()], scaf_fa)
@@ -263,6 +283,50 @@ def run_recruit(agp_lines: list, contig_seqs: dict, scaf_seqs: dict,
             if r.returncode != 0:
                 raise RuntimeError(
                     f"miniprot failed: {r.stderr.strip()[-1000:]}")
+    return gff, faa
+
+
+def find_intact_proteins(trans_path: str,
+                         min_cov: float = 0.8) -> set:
+    """Proteins with at least one intact hit on the query: aligned
+    coverage >= *min_cov* and translation free of X (no N crossing).
+
+    Parses miniprot ``--trans`` output: PAF-like lines carry the protein
+    length (field 2) and aligned protein span (fields 3-4); each is
+    followed by a ``##STA`` line with the translated sequence.
+    """
+    intact: set = set()
+    cur = None
+    cov = 0.0
+    with open(trans_path) as fh:
+        for line in fh:
+            if line.startswith("##STA"):
+                if cur and cov >= min_cov and "X" not in line:
+                    intact.add(cur)
+                cur = None
+            elif not line.startswith("#"):
+                p = line.split("\t")
+                cur = p[0]
+                cov = (int(p[3]) - int(p[2])) / max(int(p[1]), 1)
+    return intact
+
+
+def run_recruit(agp_lines: list, contig_seqs: dict, scaf_seqs: dict,
+                eligible: set, output_dir: str, reads: list,
+                proteins: str, flank: int = TX_FLANK, bait_pad: int = 2000,
+                threads: int = 4, minimap2: str = "minimap2",
+                miniprot: str = "miniprot") -> dict:
+    """Read-recruitment phase: combined bait of gap flanks + broken-gene
+    loci, then extract the recruited read pairs for targeted assembly.
+
+    Writes ``rnafill.recruit_1/2.fastq`` (or .fastq + .fastq for SE) plus
+    the bait reference and intermediate miniprot outputs into
+    *output_dir*.  Returns a stats dict.
+    """
+    import subprocess
+
+    gff, faa = _ensure_query_miniprot(scaf_seqs, proteins, output_dir,
+                                      miniprot=miniprot, threads=threads)
 
     scaf_lens = {n: len(s) for n, s in scaf_seqs.items()}
     broken = find_broken_loci(gff, faa, scaf_lens, pad=bait_pad)
@@ -539,6 +603,372 @@ def parse_tx_extensions(paf_path: str, tx_files,
     return out
 
 
+# ---------------------------------------------------------------------
+# ref-guided whole-gene placement
+#
+# When a gene's entire locus is N in the query there is no flank for a
+# transcript to anchor to, yet a close reference knows where the gene
+# sits and nearscaff's tiered PAF already maps query contigs onto the
+# reference.  The functions below bracket each unfilled gap on the
+# reference (via the flanking contigs' alignments), find the reference
+# genes lying fully inside the bracket (those genes are necessarily
+# missing from the query — the region is all N), assign transcripts to
+# them by mapping the transcripts against the reference, and write the
+# transcript sequence into the gap as exon components separated by
+# estimated-N intron/intergenic spacers.
+# ---------------------------------------------------------------------
+
+def read_ref_genes(gff_path: str) -> dict:
+    """Ref gene loci from a GFF3: {chr: [(beg0, end, gene_id, strand)]}.
+
+    mRNA/transcript lines are preferred; if none are present the file is
+    re-scanned for gene lines.  Coordinates are 0-based half-open.
+    """
+    def _scan(kinds: set) -> dict:
+        genes: dict[str, list] = {}
+        with open(gff_path) as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                p = line.rstrip("\n").split("\t")
+                if len(p) < 9 or p[2] not in kinds:
+                    continue
+                gid = ""
+                for f in p[8].split(";"):
+                    if f.startswith("ID="):
+                        gid = f[3:]
+                        break
+                genes.setdefault(p[0], []).append(
+                    (int(p[3]) - 1, int(p[4]), gid or f"{p[0]}:{p[3]}-{p[4]}",
+                     p[6]))
+        return genes
+
+    genes = _scan({"mRNA", "transcript"})
+    if not genes:
+        genes = _scan({"gene"})
+    for v in genes.values():
+        v.sort()
+    return genes
+
+
+def derive_ref_genes(ref_fa: str, proteins: str, work_dir: str,
+                     miniprot: str = "miniprot", threads: int = 4) -> dict:
+    """Ref gene loci by mapping reference proteins back onto the
+    reference genome with miniprot (cached as rnafill.refgenes.gff)."""
+    import subprocess
+    gff = os.path.join(work_dir, "rnafill.refgenes.gff")
+    if not os.path.exists(gff):
+        cmd = [miniprot, "-I", "-t", str(threads), "--gff", ref_fa, proteins]
+        logger.info("Running: %s > %s", " ".join(cmd), gff)
+        with open(gff, "w") as fh:
+            r = subprocess.run(cmd, stdout=fh, stderr=subprocess.PIPE,
+                               text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"miniprot failed: {r.stderr.strip()[-1000:]}")
+    genes: dict[str, list] = {}
+    with open(gff) as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 9 or p[2] != "mRNA":
+                continue
+            target = ""
+            for f in p[8].split(";"):
+                if f.startswith("Target="):
+                    target = f[7:].split()[0]
+            genes.setdefault(p[0], []).append(
+                (int(p[3]) - 1, int(p[4]), target or f"{p[0]}:{p[3]}-{p[4]}",
+                 p[6]))
+    for v in genes.values():
+        v.sort()
+    return genes
+
+
+def contig_ref_index(tiered_paf: str) -> dict:
+    """{contig: [(qs, qe, strand, ref_chr, ts, te, is_primary)]} from
+    nearscaff_tiered.paf (all alignments, not just the tier tag)."""
+    idx: dict[str, list] = {}
+    with open(tiered_paf) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 12 or p[5] == "*":
+                continue
+            idx.setdefault(p[0], []).append(
+                (int(p[2]), int(p[3]), p[4], p[5],
+                 int(p[7]), int(p[8]), "tp:A:P" in p[12:]))
+    return idx
+
+
+def _map_to_ref(aligns: list, coord: int) -> tuple | None:
+    """Map a 1-based contig coordinate to (ref_chr, ref_pos0, strand)
+    via the covering alignment (primary preferred, then longest)."""
+    c0 = coord - 1
+    best = None
+    for qs, qe, strand, tname, ts, te, primary in aligns:
+        if not (qs <= c0 < qe):
+            continue
+        ref = ts + (c0 - qs) if strand == "+" else te - (c0 - qs) - 1
+        cand = (tname, ref, strand, primary, qe - qs)
+        if best is None or (primary, qe - qs) > (best[3], best[4]):
+            best = cand
+    return best[:3] if best else None
+
+
+def gap_ref_brackets(agp_lines: list, gaps: set, contig_idx: dict,
+                     max_bracket: int = PLACE_MAX_BRACKET) -> dict:
+    """Bracket each gap on the reference: {agp_idx: (ref_chr, r0, r1, flip)}.
+
+    The gap's flanking components' gap-side ends are mapped through the
+    tiered PAF.  A bracket is kept only when both ends land on the same
+    reference chromosome with consistent strand and span at most
+    *max_bracket*.  *flip* is True when scaffold-forward runs against
+    the reference forward direction.
+    """
+    brackets: dict = {}
+    for i, line in enumerate(agp_lines):
+        if not isinstance(line, AGPGapLine) or i not in gaps:
+            continue
+        left = right = None
+        for j in range(i - 1, -1, -1):
+            if agp_lines[j].object_name != line.object_name:
+                break
+            if isinstance(agp_lines[j], AGPSeqLine):
+                left = agp_lines[j]
+                break
+        for j in range(i + 1, len(agp_lines)):
+            if agp_lines[j].object_name != line.object_name:
+                break
+            if isinstance(agp_lines[j], AGPSeqLine):
+                right = agp_lines[j]
+                break
+        if left is None or right is None:
+            continue
+        # gap-side end of each flank, in 1-based contig coordinates
+        lc = left.component_end if left.orientation == "+" \
+            else left.component_beg
+        rc = right.component_beg if right.orientation == "+" \
+            else right.component_end
+        lm = _map_to_ref(contig_idx.get(left.component_id, []), lc)
+        rm = _map_to_ref(contig_idx.get(right.component_id, []), rc)
+        if lm is None or rm is None:
+            continue
+        if lm[0] != rm[0] or lm[2] != rm[2]:
+            continue
+        r0, r1 = sorted((lm[1], rm[1]))
+        if r1 - r0 <= 0 or r1 - r0 > max_bracket:
+            continue
+        brackets[i] = (lm[0], r0, r1, lm[2] == "-")
+    return brackets
+
+
+_CG_OP = re.compile(r"(\d+)([MIDNSHP=X])")
+
+
+def assign_tx_to_genes(refmap_paf: str, ref_genes: dict,
+                       min_ovlp: float = PLACE_MIN_OVLP) -> dict:
+    """Assign transcripts to ref genes via their splice alignments.
+
+    Only primary alignments are used; an alignment is assigned to the
+    same-chromosome gene it overlaps best, provided
+    max(ovlp/gene_len, ovlp/aln_span) >= *min_ovlp*.  Each transcript is
+    assigned to at most one gene (its best), each gene keeps its most
+    overlapping transcript.  Returns {gene_id: (tx_name, paf_fields)}.
+    """
+    per_tx: dict[str, tuple] = {}    # tx -> (ovlp, gene_id, fields)
+    per_gene: dict[str, tuple] = {}  # gene_id -> (ovlp, tx, fields)
+    with open(refmap_paf) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 12 or p[2] == "*" or p[5] == "*":
+                continue
+            if "tp:A:P" not in p[12:]:
+                continue
+            ts, te = int(p[7]), int(p[8])
+            best = None
+            for gb, ge, gid, _st in ref_genes.get(p[5], []):
+                if gb >= te:
+                    break
+                ov = min(te, ge) - max(ts, gb)
+                if ov <= 0:
+                    continue
+                if max(ov / (ge - gb), ov / max(te - ts, 1)) < min_ovlp:
+                    continue
+                if best is None or ov > best[0]:
+                    best = (ov, gid)
+            if best is None:
+                continue
+            ov, gid = best
+            if ov > per_tx.get(p[0], (0,))[0]:
+                per_tx[p[0]] = (ov, gid, p)
+    for tx, (ov, gid, p) in per_tx.items():
+        if ov > per_gene.get(gid, (0,))[0]:
+            per_gene[gid] = (ov, tx, p)
+    return {gid: (tx, p) for gid, (_ov, tx, p) in per_gene.items()}
+
+
+def build_gene_placement(tx_seq: str, paf_fields: list, r0: int, r1: int,
+                         min_spacer: int = PLACE_MIN_SPACER,
+                         max_spacer: int = PLACE_MAX_SPACER) -> list:
+    """Exon/N-spacer blocks for one assigned transcript, REF-forward.
+
+    The transcript's cg CIGAR (spliced alignment vs the reference) is
+    walked with a query and a reference cursor: M/=/X chunks are exonic
+    sequence cut from the transcript, N ops become intron placeholders
+    of the reference-derived length (clamped to [min_spacer, max_spacer])
+    — a pure (None, est_len) gap-row tuple when the intron is clipped by
+    the bracket, otherwise a sequence block with the canonical splice
+    consensus stamped on its edges (GT..AG, or CT..AC for minus-strand
+    genes) so downstream spliced aligners can cross it; I bases are kept
+    (appended to the current exon), D ops are skipped.  Exons are
+    clipped to the bracket [r0, r1) so the placement never duplicates
+    flanking sequence.  Returns a list mixing str blocks and
+    (None, est_len) tuples; empty when no exonic base falls inside the
+    bracket.
+
+    CIGAR cursor convention (verified against minimap2 2.x PAF output):
+    the reference cursor always ascends from ts; the query cursor
+    ascends from qs for "+" alignments but DESCENDS from qe for "-"
+    alignments (the CIGAR is written against the reverse-complemented
+    query), so "-" chunks are revcomped individually and the CIGAR
+    order already is the ref-forward order — no block reversal needed.
+    """
+    strand = paf_fields[4]
+    qs0, qe0 = int(paf_fields[2]), int(paf_fields[3])
+    cg = None
+    for t in paf_fields[12:]:
+        if t.startswith("cg:Z:"):
+            cg = t[5:]
+            break
+    blocks: list = []
+    if cg is None:                      # no CIGAR: one exon block
+        seg = tx_seq[qs0:qe0]
+        if strand == "-":
+            seg = _revcomp(seg)
+        blocks = [seg] if seg else []
+    else:
+        cur: list[str] = []
+        qpos = qs0 if strand == "+" else qe0
+        rpos = int(paf_fields[7])
+
+        def flush() -> None:
+            if cur:
+                blocks.append("".join(cur))
+                cur.clear()
+
+        for n_s, op in _CG_OP.findall(cg):
+            n = int(n_s)
+            if op in "M=X":
+                lo, hi = max(rpos, r0), min(rpos + n, r1)
+                if lo < hi:
+                    off = lo - rpos
+                    ln = hi - lo
+                    if strand == "+":
+                        cur.append(tx_seq[qpos + off:qpos + off + ln])
+                    else:
+                        # block covers query [qpos-n, qpos); ref offset
+                        # counts back from the block's query end
+                        qb_hi = qpos - off
+                        cur.append(_revcomp(tx_seq[qb_hi - ln:qb_hi]))
+                qpos += n if strand == "+" else -n
+                rpos += n
+            elif op == "I":
+                if r0 <= rpos <= r1:
+                    if strand == "+":
+                        cur.append(tx_seq[qpos:qpos + n])
+                    else:
+                        cur.append(_revcomp(tx_seq[qpos - n:qpos]))
+                qpos += n if strand == "+" else -n
+            elif op == "S":
+                qpos += n if strand == "+" else -n
+            elif op == "N":
+                lo, hi = max(rpos, r0), min(rpos + n, r1)
+                if hi - lo >= min_spacer:
+                    flush()
+                    sp = min(hi - lo, max_spacer)
+                    if lo == rpos and hi == rpos + n and sp >= 4:
+                        # unclipped intron: splicing is proven by the
+                        # CIGAR — stamp the canonical splice consensus
+                        # (strand-aware) onto the placeholder so miniprot
+                        # / ab initio annotators can splice across it
+                        donor, acc = ("GT", "AG") if strand == "+" \
+                            else ("CT", "AC")
+                        blocks.append(donor + "N" * (sp - 4) + acc)
+                    else:
+                        blocks.append((None, sp))
+                rpos += n
+            elif op == "D":
+                rpos += n
+            # H/P consume nothing on either cursor here
+        flush()
+    blocks = [b for b in blocks
+              if (isinstance(b, str) and b) or isinstance(b, tuple)]
+    return blocks
+
+
+def plan_placements(brackets: dict, ref_genes: dict, gene_tx: dict,
+                    tx_seqs: dict, max_genes: int = PLACE_MAX_GENES,
+                    max_spacer: int = PLACE_MAX_SPACER,
+                    min_edge: int = PLACE_MIN_EDGE) -> tuple:
+    """Assemble per-gap placements in scaffold-forward order.
+
+    *brackets* comes from gap_ref_brackets (restricted to the gaps still
+    unfilled), *gene_tx* from assign_tx_to_genes, *tx_seqs* holds the
+    assigned transcripts' sequences.  Genes fully inside the bracket are
+    laid out in reference order; intergenic and bracket-edge spacers are
+    estimated-N gap rows (clamped; edge spacers shorter than *min_edge*
+    are dropped so a gene flush against the flank hugs it).  Returns
+    (placements, detail): placements = {agp_idx: [blocks]},
+    detail = {agp_idx: [(gene_id, tx_name, exon_bases)]}.
+    """
+    placements: dict = {}
+    detail: dict = {}
+    for gidx, (chr_, r0, r1, flip) in sorted(brackets.items()):
+        genes = [g for g in ref_genes.get(chr_, [])
+                 if g[0] >= r0 and g[1] <= r1 and g[2] in gene_tx]
+        if not genes:
+            continue
+        if len(genes) > max_genes:
+            logger.info("Placement skipped for gap idx %d (%s:%d-%d): "
+                        "%d genes > --place-max-genes %d",
+                        gidx, chr_, r0, r1, len(genes), max_genes)
+            continue
+        genes.sort()
+        placed: list = []     # (gb, ge, gene_id, tx_name, blocks)
+        for gb, ge, gid, _st in genes:
+            txn, paf = gene_tx[gid]
+            seq = tx_seqs.get(txn)
+            if seq is None:
+                continue
+            gblocks = build_gene_placement(seq, paf, r0, r1)
+            if gblocks:
+                placed.append((gb, ge, gid, txn, gblocks))
+        if not placed:
+            continue
+        blocks: list = []
+        d = placed[0][0] - r0
+        if d >= min_edge:
+            blocks.append((None, min(d, max_spacer)))
+        for k, (gb, ge, gid, txn, gblocks) in enumerate(placed):
+            blocks.extend(gblocks)
+            if k + 1 < len(placed):
+                d = placed[k + 1][0] - ge
+                blocks.append((None, min(max(d, min_edge), max_spacer)))
+        d = r1 - placed[-1][1]
+        if d >= min_edge:
+            blocks.append((None, min(d, max_spacer)))
+        if flip:
+            blocks = [_revcomp(b) if isinstance(b, str) else b
+                      for b in reversed(blocks)]
+        placements[gidx] = blocks
+        detail[gidx] = [(gid, txn,
+                         sum(len(b) for b in gblocks if isinstance(b, str)))
+                        for _gb, _ge, gid, txn, gblocks in placed]
+    return placements, detail
+
+
 def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
                 output_dir: str, transcripts: list | None = None,
                 fill_mode: str = "cdna",
@@ -559,7 +989,13 @@ def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
                 bait_pad: int = 2000,
                 miniprot: str = "miniprot",
                 minimap2: str = "minimap2",
-                recruit_extra: list | None = None) -> dict:
+                recruit_extra: list | None = None,
+                ref: str | None = None,
+                ref_gff: str | None = None,
+                place_max_bracket: int = PLACE_MAX_BRACKET,
+                place_max_genes: int = PLACE_MAX_GENES,
+                place_min_ovlp: float = PLACE_MIN_OVLP,
+                place_intact_cov: float = PLACE_INTACT_COV) -> dict:
     """Transcript-guided filling of genic gaps via flank recruitment.
 
     *transcripts* is a list of FASTA/FASTQ(.gz) files (Iso-Seq, ONT cDNA
@@ -571,7 +1007,20 @@ def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
     its flank).  With *internal_n* > 0, N runs of at least that length
     inside components are exploded into gap rows first and filled by the
     same machinery (short-read assemblies carry N runs inside their
-    scaffolds; HiFi assemblies have none).  Returns the report dict.
+    scaffolds; HiFi assemblies have none).  With *ref* (reference genome
+    FASTA), gaps still unfilled after all flank-based mechanisms get a
+    ref-guided placement pass: the gap is bracketed on the reference via
+    its flanking contigs' tiered-PAF alignments, reference genes lying
+    fully inside the bracket (necessarily missing from the query — the
+    region is all N) are matched to transcripts mapped against the
+    reference, and the transcript sequence is written into the gap as
+    exon components separated by estimated-N intron/intergenic spacers.
+    Reference gene coordinates come from *ref_gff* when given, else from
+    miniprot mapping *proteins* back onto *ref*.  With miniprot-derived
+    loci, an anti-duplication filter applies: a ref gene whose protein
+    already has an intact hit anywhere in the query (aligned coverage >=
+    *place_intact_cov*, translation free of X) is not missing and is
+    excluded from placement.  Returns the report dict.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -678,14 +1127,84 @@ def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
                     sum(len(l or "") + len(r or "")
                         for l, r in ext_idx.values()))
 
+    # ref-guided whole-gene placement for gaps nothing else could fill
+    place_idx: dict = {}
+    placed_rows: list = []
+    if ref:
+        remaining = set(eligible) - set(fills_idx) - set(ext_idx)
+        cidx = contig_ref_index(tiered_paf)
+        brackets = gap_ref_brackets(agp_lines, remaining, cidx,
+                                    max_bracket=place_max_bracket)
+        logger.info("Ref-guided placement: %d/%d unfilled gaps bracketed "
+                    "on the reference", len(brackets), len(remaining))
+        if brackets:
+            if ref_gff:
+                ref_genes = read_ref_genes(ref_gff)
+            else:
+                if not proteins:
+                    raise ValueError(
+                        "ref-guided placement without --ref-gff requires "
+                        "--proteins (miniprot derives the ref gene loci)")
+                ref_genes = derive_ref_genes(ref, proteins, output_dir,
+                                             miniprot=miniprot,
+                                             threads=threads)
+            n_genes = sum(len(v) for v in ref_genes.values())
+            logger.info("Reference gene loci: %d (%s)", n_genes,
+                        ref_gff or "miniprot-derived")
+            if ref_gff:
+                logger.info("NOTE: --ref-gff loci skip the intact-protein "
+                            "anti-duplication check (no protein-id mapping)")
+            else:
+                # anti-duplication: a ref gene whose protein already has an
+                # intact hit anywhere in the query is not missing — do not
+                # place a second copy (misplaced contigs / paralogs would
+                # otherwise duplicate it)
+                _gff_q, faa_q = _ensure_query_miniprot(
+                    scaf_seqs, proteins, output_dir, miniprot=miniprot,
+                    threads=threads)
+                intact = find_intact_proteins(
+                    faa_q, min_cov=place_intact_cov)
+                n_before = sum(len(v) for v in ref_genes.values())
+                ref_genes = {c: [g for g in gs if g[2] not in intact]
+                             for c, gs in ref_genes.items()}
+                logger.info("Intact-protein filter: %d/%d ref loci already "
+                            "present in the query (cov>=%.2f, no X) — "
+                            "excluded from placement",
+                            n_before - sum(len(v) for v in
+                                           ref_genes.values()),
+                            n_before, place_intact_cov)
+            refmap = os.path.join(output_dir, "rnafill.refmap.paf")
+            if not os.path.exists(refmap):
+                run_minimap2(ref, transcripts, refmap, tx_preset,
+                             threads=threads, extra=["-N", "5", "-c"],
+                             minimap2=minimap2)
+            gene_tx = assign_tx_to_genes(refmap, ref_genes,
+                                         min_ovlp=place_min_ovlp)
+            logger.info("Transcripts assigned to ref genes: %d",
+                        len(gene_tx))
+            tx_seqs = _fetch_read_seqs(
+                transcripts, {txn for txn, _p in gene_tx.values()})
+            place_idx, pdetail = plan_placements(
+                brackets, ref_genes, gene_tx, tx_seqs,
+                max_genes=place_max_genes)
+            idx_to_gid = {i: g for g, i in gid_to_idx.items()}
+            for gidx, metas in pdetail.items():
+                for gene_id, txn, nb in metas:
+                    placed_rows.append((idx_to_gid[gidx], gene_id, txn, nb))
+            logger.info("Ref-guided placements: %d gaps, %d genes (%d bp "
+                        "of exonic sequence)", len(place_idx),
+                        len(placed_rows),
+                        sum(nb for _g, _i, _t, nb in placed_rows))
+
     out_agp = os.path.join(output_dir, "nearscaff.rnafill.agp")
     out_fasta = os.path.join(output_dir, "nearscaff.rnafill.scaffolds.fa")
     fill_report = write_outputs(agp_lines, eligible, fills_idx, contig_seqs,
                                 out_agp, out_fasta, fill_prefix="gapfill_tx",
-                                extensions=ext_idx)
+                                extensions=ext_idx, placements=place_idx)
     report.update(fill_report)
     report.update(stats)
     report["overlap_closed"] = len(ovl)
+    report["genes_placed"] = len(placed_rows)
     report["fill_mode"] = fill_mode
 
     # per-closure manifest for downstream cross-validation
@@ -697,6 +1216,10 @@ def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
             kind, qn, mid = detail[g]
             scaf, gb, ge = _gid_coords(g)
             f.write(f"{g}\t{scaf}\t{gb + 1}\t{ge}\t{kind}\t{mid}\t{qn}\n")
+        for g, gene_id, txn, nb in placed_rows:
+            scaf, gb, ge = _gid_coords(g)
+            f.write(f"{g}\t{scaf}\t{gb + 1}\t{ge}\tplaced:{gene_id}\t{nb}"
+                    f"\t{txn}\n")
     logger.info("Closure manifest: %s", closures_tsv)
     logger.info("rna-fill complete (%s mode): %d/%d eligible gaps closed "
                 "(%d bp filled)", fill_mode, report["gaps_closed"],

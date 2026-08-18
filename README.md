@@ -204,6 +204,26 @@ exons — the gap is (mostly) intronic — and is closed by abutting
 exon-only also skips gaps whose visible edges look like canonical
 splice sites (GT..AG on either strand).
 
+**Ref-guided whole-gene placement.** A gene whose entire locus is N in
+the query has no flanks for a transcript to anchor to, so flank-based
+filling can never recover it — yet the transcriptome often assembles
+that gene just fine. With `--ref REF.fa` rna-fill adds a final pass
+over the gaps nothing else could fill: the gap is bracketed on the
+reference through its flanking contigs' alignments, reference genes
+lying fully inside the bracket are matched to transcripts (mapped
+against the reference), and the transcript sequence is written into the
+gap in reference order — exon components of real sequence separated by
+estimated-N intron/intergenic spacers whose lengths come from the
+reference. Gene coordinates come from `--ref-gff` when given, else from
+miniprot mapping `--proteins` back onto the reference:
+
+```bash
+nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
+    -T assembled.fa -o OUT_rnafill -t 16 \
+    --internal-n 20 --fill-mode exon-only --one-sided \
+    --ref REF.fa --proteins REF.pep.fa   # or: --ref-gff REF.gff3
+```
+
 Options: `--fill-mode {cdna,exon-only}`; `--tx-preset` (default
 `splice:hq`; use `splice` for noisy cDNA); `--tx-min-span INT`;
 `--abut-window INT` (default 30); `--max-depth-factor FLOAT` (multi-
@@ -214,7 +234,12 @@ and extends >=500 bp into the gap, write the covered sequence next to
 that flank and leave a residual gap); `--internal-n LEN` (also fill N
 runs >= LEN bp *inside* components — short-read assemblies carry
 estimated-length N runs within their scaffolds; HiFi assemblies have
-none; default 0 disables). Requires `minimap2` on `PATH`.
+none; default 0 disables); `--ref REF.fa` + `--ref-gff GFF3` /
+`--proteins` (ref-guided whole-gene placement; `--place-max-bracket`
+default 1 Mb, `--place-max-genes` default 50, `--place-min-ovlp`
+default 0.5; `--place-intact-cov` default 0.8 — a reference gene whose
+protein already has an intact, X-free hit anywhere in the query is not
+placed again, guarding against paralog / misplacement duplicates). Requires `minimap2` on `PATH`.
 
 Outputs: `nearscaff.rnafill.agp` and `nearscaff.rnafill.scaffolds.fa`
 (fill components are named `*_gapfill_tx*`), plus a report split by

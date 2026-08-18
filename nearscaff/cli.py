@@ -232,6 +232,34 @@ def main():
     p_rf.add_argument("--bait-pad", type=int, default=2000,
                       help="Padding around broken-gene bait loci "
                       "(default: 2000)")
+    p_rf.add_argument("--ref", default=None, metavar="REF_FA",
+                      help="Reference genome FASTA — enables ref-guided "
+                      "whole-gene placement: gaps nothing else could "
+                      "fill are bracketed on the reference via the "
+                      "flanking contigs, and transcripts matching "
+                      "reference genes inside the bracket are written "
+                      "into the gap (exons + estimated-N introns)")
+    p_rf.add_argument("--ref-gff", default=None, metavar="GFF3",
+                      help="Reference gene annotation for --ref "
+                      "(default: derive the loci with miniprot from "
+                      "--proteins)")
+    p_rf.add_argument("--place-max-bracket", type=int, default=1000000,
+                      metavar="BP",
+                      help="Ref-guided placement: skip gaps whose "
+                      "reference bracket exceeds this size (default: "
+                      "1000000)")
+    p_rf.add_argument("--place-max-genes", type=int, default=50,
+                      help="Ref-guided placement: max genes placed per "
+                      "gap (default: 50)")
+    p_rf.add_argument("--place-min-ovlp", type=float, default=0.5,
+                      help="Ref-guided placement: min overlap fraction "
+                      "between a transcript alignment and a reference "
+                      "gene locus (default: 0.5)")
+    p_rf.add_argument("--place-intact-cov", type=float, default=0.8,
+                      help="Ref-guided placement: a reference gene whose "
+                      "protein already maps intact to the query "
+                      "(coverage >= this, no X) is not placed again "
+                      "(default: 0.8)")
 
     args = parser.parse_args()
 
@@ -491,7 +519,13 @@ def _cmd_rnafill(args):
             internal_n=args.internal_n,
             reads=list(args.reads) if args.reads else None,
             proteins=args.proteins,
-            bait_pad=args.bait_pad)
+            bait_pad=args.bait_pad,
+            ref=args.ref,
+            ref_gff=args.ref_gff,
+            place_max_bracket=args.place_max_bracket,
+            place_max_genes=args.place_max_genes,
+            place_min_ovlp=args.place_min_ovlp,
+            place_intact_cov=args.place_intact_cov)
     except (ValueError, RuntimeError) as e:
         logging.getLogger("nearscaff").error("rna-fill failed: %s", e)
         sys.exit(1)
@@ -514,6 +548,8 @@ def _cmd_rnafill(args):
           f"abut: {report.get('abut', 0)}, "
           f"overlap: {report.get('overlap_closed', 0)}, "
           f"one-sided extensions: {report.get('gaps_extended', 0)}, "
+          f"ref-guided placements: {report.get('gaps_placed', 0)} gaps/"
+          f"{report.get('genes_placed', 0)} genes, "
           f"skipped as intronic: {report.get('intron_skipped', 0)})")
     if args.fill_mode == "cdna":
         print("NOTE: fills are cDNA — introns inside closed gaps are "

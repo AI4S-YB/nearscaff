@@ -72,7 +72,7 @@ def test_write_outputs_end_to_end(tmp_path):
     assert report == {"gaps_total": 3, "gaps_eligible": 1,
                       "gaps_closed": 1, "gaps_resized": 0,
                       "gaps_endjoined": 0, "gaps_extended": 0,
-                      "bases_filled": 6}
+                      "gaps_placed": 0, "bases_filled": 6}
 
     lines = AGPReader().parse(open(out_agp).read())
     # gap 1 replaced by a W component of length 6; coordinates re-numbered
