@@ -111,6 +111,128 @@ def main():
                       help="Diploid reference genome FASTA (required with "
                       "--guide)")
 
+    # ---- subcommand: gapfill ----
+    p_gf = sub.add_parser(
+        "gapfill",
+        help="Selectively fill high-confidence scaffold gaps with long "
+             "reads (HiFi/ONT), via flank mini-reference recruitment")
+    p_gf.add_argument("-a", "--agp", required=True,
+                      help="nearscaff AGP (nearscaff.agp)")
+    p_gf.add_argument("-q", "--query", required=True,
+                      help="Query genome FASTA (original contigs)")
+    p_gf.add_argument("--tiered-paf", default=None,
+                      help="nearscaff_tiered.paf (default: alongside the AGP)")
+    p_gf.add_argument("-o", "--output", default="nearscaff_gapfill",
+                      help="Output directory (default: nearscaff_gapfill)")
+    p_gf.add_argument("-t", "--threads", type=int, default=4,
+                      help="CPU threads (default: 4)")
+    p_gf.add_argument("-r", "--reads", nargs="+", default=None,
+                      help="Long-read FASTQ(.gz) file(s) (--method lr)")
+    p_gf.add_argument("-1", "--reads1", default=None,
+                      help="WGS R1 FASTQ(.gz) (--method sr)")
+    p_gf.add_argument("-2", "--reads2", default=None,
+                      help="WGS R2 FASTQ(.gz) (--method sr)")
+    p_gf.add_argument("--method", choices=["lr", "sr"], default="lr",
+                      help="lr: long reads (default); sr: short reads "
+                      "(paired-end) — NOTE: sr mode has a high false-"
+                      "positive rate at repeat-rich junctions, use with "
+                      "caution")
+    p_gf.add_argument("--sr-insert", type=int, default=500,
+                      help="Nominal fragment insert size for sr PE-span "
+                      "gap size estimates (default: 500)")
+    p_gf.add_argument("--lr-preset", default="map-hifi",
+                      choices=["map-hifi", "map-ont"],
+                      help="minimap2 preset for long-read recruitment "
+                      "(default: map-hifi)")
+    p_gf.add_argument("--lr-min-span", type=int, default=1,
+                      help="Min spanning reads required for a span closure "
+                      "(default: 1)")
+    p_gf.add_argument("--max-depth-factor", type=float, default=3.0,
+                      help="Span closures: reject gaps whose spanning depth "
+                      "exceeds factor x median depth (over-collapsed "
+                      "repeats); 0 disables (default: 3.0)")
+    p_gf.add_argument("--no-overlap-closure", action="store_true",
+                      help="Span closures only; skip tail-overlap closure")
+    p_gf.add_argument("--fill-tiers", default="protein,asm5",
+                      help="Comma-separated flanking tiers eligible for "
+                      "filling (default: protein,asm5)")
+
+    # ---- subcommand: rna-fill ----
+    p_rf = sub.add_parser(
+        "rna-fill",
+        help="Fill genic scaffold gaps with transcript evidence "
+             "(Iso-Seq/ONT cDNA/assembled transcripts), via flank "
+             "mini-reference recruitment")
+    p_rf.add_argument("-a", "--agp", required=True,
+                      help="nearscaff AGP (nearscaff.agp)")
+    p_rf.add_argument("-q", "--query", required=True,
+                      help="Query genome FASTA (original contigs)")
+    p_rf.add_argument("--tiered-paf", default=None,
+                      help="nearscaff_tiered.paf (default: alongside the AGP)")
+    p_rf.add_argument("-T", "--transcripts", nargs="+", default=None,
+                      help="Transcript FASTA/FASTQ(.gz) file(s): Iso-Seq, "
+                      "ONT cDNA or assembled transcripts (assemble "
+                      "short-read RNA-seq first, e.g. Trinity). "
+                      "Optional when --reads is given (recruit-only mode)")
+    p_rf.add_argument("-o", "--output", default="nearscaff_rnafill",
+                      help="Output directory (default: nearscaff_rnafill)")
+    p_rf.add_argument("-t", "--threads", type=int, default=4,
+                      help="CPU threads (default: 4)")
+    p_rf.add_argument("--fill-mode", choices=["cdna", "exon-only"],
+                      default="cdna",
+                      help="cdna (default): fill whatever transcripts "
+                      "span — introns inside a gap are compressed out; "
+                      "exon-only: only fill gaps believed to lie inside a "
+                      "single exon (skip gaps with splice-site edges or "
+                      "intron-sized middles)")
+    p_rf.add_argument("--tx-preset", default="splice:hq",
+                      choices=["splice:hq", "splice", "map-ont", "map-hifi"],
+                      help="minimap2 preset for transcript recruitment "
+                      "(default: splice:hq; use splice for noisy cDNA)")
+    p_rf.add_argument("--tx-min-span", type=int, default=1,
+                      help="Min spanning transcripts per span closure "
+                      "(default: 1)")
+    p_rf.add_argument("--abut-window", type=int, default=30,
+                      help="Middle segments up to this size are treated as "
+                      "abutting exons (intronic gap; default: 30)")
+    p_rf.add_argument("--max-depth-factor", type=float, default=3.0,
+                      help="Span closures: reject gaps whose spanning "
+                      "transcript depth exceeds factor x median depth "
+                      "(multi-copy families); 0 disables (default: 3.0)")
+    p_rf.add_argument("--no-overlap-closure", action="store_true",
+                      help="Span closures only; skip tail-overlap closure")
+    p_rf.add_argument("--one-sided", action="store_true",
+                      help="Also partially fill gaps no transcript spans: "
+                      "when a transcript covers one edge and extends into "
+                      "the gap, write the covered sequence next to that "
+                      "flank and leave a residual gap")
+    p_rf.add_argument("--ext-min-tail", type=int, default=500,
+                      help="One-sided extension: min tail length into the "
+                      "gap (default: 500)")
+    p_rf.add_argument("--ext-max-tail", type=int, default=20000,
+                      help="One-sided extension: tails are capped at this "
+                      "length (default: 20000)")
+    p_rf.add_argument("--fill-tiers", default="protein,asm5",
+                      help="Comma-separated flanking tiers eligible for "
+                      "filling (default: protein,asm5)")
+    p_rf.add_argument("--internal-n", type=int, default=0, metavar="LEN",
+                      help="Also fill N runs >= LEN bp *inside* components "
+                      "(short-read assemblies carry N runs within their "
+                      "scaffolds; 0 disables, default: 0)")
+    p_rf.add_argument("--reads", nargs="+", default=None, metavar="FQ",
+                      help="Raw RNA reads (FASTQ(.gz), one or two files) — "
+                      "run the recruitment phase: build the combined bait "
+                      "(gap flanks + broken-gene loci from --proteins), "
+                      "map reads, and write rnafill.recruit_*.fastq for "
+                      "targeted assembly. Combine with -T to fill in the "
+                      "same run")
+    p_rf.add_argument("--proteins", default=None, metavar="PEP",
+                      help="Reference protein FASTA — required by --reads "
+                      "(miniprot finds the broken-gene bait loci)")
+    p_rf.add_argument("--bait-pad", type=int, default=2000,
+                      help="Padding around broken-gene bait loci "
+                      "(default: 2000)")
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -121,6 +243,13 @@ def main():
     if args.command == "run":
         if not args.gff3 and not args.proteins:
             parser.error("'run' requires either --gff3 or --proteins")
+    if args.command == "rna-fill":
+        if not args.transcripts and not args.reads:
+            parser.error("'rna-fill' requires either --transcripts (-T) "
+                         "or --reads")
+        if args.reads and not args.proteins:
+            parser.error("'--reads' requires --proteins (broken-gene bait "
+                         "is built from miniprot protein alignments)")
 
     config = _build_config(args)
 
@@ -130,6 +259,10 @@ def main():
         _cmd_scaffold(config, args)
     elif args.command == "kmer-phase":
         _cmd_kmer_phase(args)
+    elif args.command == "gapfill":
+        _cmd_gapfill(args)
+    elif args.command == "rna-fill":
+        _cmd_rnafill(args)
 
 
 def _build_config(args) -> NearscaffConfig:
@@ -271,6 +404,121 @@ def _cmd_kmer_phase(args):
     elapsed = time.time() - t0
     print(f"nearscaff kmer-phase completed in {elapsed:.1f}s")
     print(f"Phased {len(result)} contigs -> {args.output}")
+
+
+def _cmd_gapfill(args):
+    from nearscaff.gapfill import run_gapfill
+    import logging
+    import os
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
+    tiered_paf = args.tiered_paf or os.path.join(
+        os.path.dirname(os.path.abspath(args.agp)), "nearscaff_tiered.paf")
+    if not os.path.exists(tiered_paf):
+        logging.getLogger("nearscaff").error(
+            "tiered PAF not found: %s (pass --tiered-paf)", tiered_paf)
+        sys.exit(1)
+
+    t0 = time.time()
+    reads = list(args.reads or [])
+    if args.method == "sr":
+        if not (args.reads1 and args.reads2):
+            logging.getLogger("nearscaff").error(
+                "--method sr requires -1 and -2 (paired-end reads)")
+            sys.exit(1)
+        reads = [args.reads1, args.reads2]
+    elif not reads:
+        logging.getLogger("nearscaff").error(
+            "gapfill requires long-read FASTQ via -r/--reads")
+        sys.exit(1)
+    try:
+        report = run_gapfill(
+            args.agp, args.query, tiered_paf, args.output,
+            reads=reads, method=args.method, lr_preset=args.lr_preset,
+            threads=args.threads,
+            fill_tiers=set(args.fill_tiers.split(",")),
+            min_span_reads=args.lr_min_span,
+            overlap_closure=not args.no_overlap_closure,
+            sr_insert=args.sr_insert,
+            max_depth_factor=args.max_depth_factor or None)
+    except (ValueError, RuntimeError) as e:
+        logging.getLogger("nearscaff").error("gapfill failed: %s", e)
+        sys.exit(1)
+
+    elapsed = time.time() - t0
+    print(f"nearscaff gapfill completed in {elapsed:.1f}s")
+    print(f"Closed {report['gaps_closed']}/{report['gaps_eligible']} "
+          f"eligible gaps ({report['bases_filled']} bp filled, "
+          f"span: {report.get('span_closed', 0)}, "
+          f"overlap: {report.get('overlap_closed', 0)}, "
+          f"PE-resized: {report.get('pe_resized', 0)}, "
+          f"end-joins: {report.get('gaps_endjoined', 0) + report.get('endjoin_abut', 0)})")
+    print(f"Output: {args.output}")
+
+
+def _cmd_rnafill(args):
+    from nearscaff.rnafill import run_rnafill
+    import logging
+    import os
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+
+    tiered_paf = args.tiered_paf or os.path.join(
+        os.path.dirname(os.path.abspath(args.agp)), "nearscaff_tiered.paf")
+    if not os.path.exists(tiered_paf):
+        logging.getLogger("nearscaff").error(
+            "tiered PAF not found: %s (pass --tiered-paf)", tiered_paf)
+        sys.exit(1)
+
+    t0 = time.time()
+    try:
+        report = run_rnafill(
+            args.agp, args.query, tiered_paf, args.output,
+            transcripts=list(args.transcripts) if args.transcripts else None,
+            fill_mode=args.fill_mode,
+            tx_preset=args.tx_preset, threads=args.threads,
+            fill_tiers=set(args.fill_tiers.split(",")),
+            min_span_tx=args.tx_min_span,
+            overlap_closure=not args.no_overlap_closure,
+            one_sided=args.one_sided,
+            ext_min_tail=args.ext_min_tail,
+            ext_max_tail=args.ext_max_tail,
+            abut_window=args.abut_window,
+            max_depth_factor=args.max_depth_factor or None,
+            internal_n=args.internal_n,
+            reads=list(args.reads) if args.reads else None,
+            proteins=args.proteins,
+            bait_pad=args.bait_pad)
+    except (ValueError, RuntimeError) as e:
+        logging.getLogger("nearscaff").error("rna-fill failed: %s", e)
+        sys.exit(1)
+
+    elapsed = time.time() - t0
+    print(f"nearscaff rna-fill completed in {elapsed:.1f}s")
+    if "recruit" in report:
+        r = report["recruit"]
+        print(f"Recruitment: {r['bait_records']} bait records "
+              f"({r['broken_loci']} broken-gene loci), "
+              f"{r['recruited_names']} read names -> "
+              f"{' '.join(r['recruit_fastqs'])}")
+    if "gaps_closed" not in report:
+        print("Recruit-only mode: assemble the recruited reads, then "
+              "re-run with -T to fill")
+        return
+    print(f"Closed {report['gaps_closed']}/{report['gaps_eligible']} "
+          f"eligible gaps ({report['bases_filled']} bp filled, "
+          f"span: {report.get('span_filled', 0)}, "
+          f"abut: {report.get('abut', 0)}, "
+          f"overlap: {report.get('overlap_closed', 0)}, "
+          f"one-sided extensions: {report.get('gaps_extended', 0)}, "
+          f"skipped as intronic: {report.get('intron_skipped', 0)})")
+    if args.fill_mode == "cdna":
+        print("NOTE: fills are cDNA — introns inside closed gaps are "
+              "compressed out; use for annotation completeness")
+    print(f"Output: {args.output}")
 
 
 if __name__ == "__main__":

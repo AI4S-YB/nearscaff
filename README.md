@@ -100,6 +100,133 @@ default 50000), `--unknown-gap-size` (default 100),
 `--nucleotide-passes`, `--secondary-alignments` and `--no-reuse-index`
 (as above).
 
+## Gap filling with long reads (gapfill)
+
+`nearscaff gapfill` selectively closes scaffold gaps with long reads
+(HiFi/ONT). Only gaps flanked by high-confidence contigs — tiers
+`protein`/`asm5` by default, read from `nearscaff_tiered.paf` — are
+eligible; gaps touching lower-confidence (`asm20`) placements are left
+as Ns. Filling never changes scaffold topology, it only replaces
+N-runs.
+
+How it works: a mini reference of the two ~1.5 kb flanks of every
+eligible gap is built, long reads are mapped to it with minimap2, and
+gaps are closed two ways — reads spanning both flanks (consensus of the
+spanning segment), and clip tails from the two sides overlapping each
+other (dovetail overlap; the overlap segment must map to a unique locus
+in the scaffolds, which filters out repeat-driven pseudo-closures).
+
+```bash
+nearscaff gapfill -a OUT/nearscaff.agp -q QUERY.fa \
+    -r hifi.fastq.gz -o OUT_gapfill -t 16
+```
+
+Options: `--lr-preset {map-hifi,map-ont}` (default `map-hifi`);
+`--lr-min-span INT` — minimum spanning reads per span closure
+(default 1); `--max-depth-factor FLOAT` — reject span closures whose
+spanning depth exceeds factor x median depth (over-collapsed repeats;
+default 3.0, 0 disables); `--no-overlap-closure` — span closures only;
+`--fill-tiers` — flanking tiers eligible for filling (default
+`protein,asm5`). Requires `minimap2` on `PATH`.
+
+Outputs: `nearscaff.gapfill.agp` and `nearscaff.gapfill.scaffolds.fa`,
+plus a report (eligible / closed gaps, bases filled, split by span vs
+overlap closures).
+
+### Short-read mode (`--method sr`)
+
+Short reads (paired-end, `-1/-2`) can also be used. Three mechanisms:
+single-read span closures (exact sequence for tiny gaps), paired-end
+tail-overlap closures (merged pair sequence, no uniqueness filter),
+and PE-span gap resizing (AGP gap lengths replaced by insert-size
+estimates, type `N` with `paired-ends` evidence; `--sr-insert` sets the
+nominal insert size, default 500).
+
+> **CAUTION — high false-positive rate.** Contig ends are tandem
+> repeats; short-read evidence there is dominated by multi-copy
+> artifacts. On real fragmented assemblies sr mode closed ~0.1-0.6% of
+> eligible gaps with sequence (plus several hundred resized gaps). Use
+> it for closure rate, not for correctness, and prefer long reads
+> whenever available.
+
+Note: blind short-read approaches (abyss-sealer bloom walks, clip
+extension) were evaluated and removed — they closed 0 eligible gaps on
+real data. Gaps anchored in tandem repeats remain unfillable with any
+read type; expect closures mainly where the true gap is small or the
+junction is unique sequence.
+
+## Filling genic gaps with transcripts (rna-fill)
+
+`nearscaff rna-fill` closes the gaps that matter most for annotation:
+the ones inside genes. Scaffolded genomes often reach high BUSCO while
+genic regions still contain N-runs, so downstream annotation (miniprot
+etc.) recovers fragmented gene models. rna-fill maps transcript
+sequences back onto the scaffolds and fills gaps that transcripts can
+cross.
+
+Input transcripts can be Iso-Seq, ONT cDNA, or assembled transcripts
+(FASTA/FASTQ). Short-read RNA-seq must be assembled first (e.g.
+Trinity) — individual short reads cannot bridge gaps.
+
+```bash
+nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
+    -T transcripts.fa -o OUT_rnafill -t 16
+```
+
+**Recruiting reads for targeted assembly.** With raw short-read RNA-seq,
+assemble only the reads that matter: `--reads` + `--proteins` builds a
+combined bait (gap flanks — including `--internal-n` exploded internal N
+runs — plus *broken-gene loci*: miniprot-predicted mRNAs whose translation
+contains X, i.e. CDS crossing an N run) and extracts the recruited reads
+and their mates:
+
+```bash
+nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
+    --reads RNA_R1.fq.gz RNA_R2.fq.gz --proteins REF.pep.fa \
+    --internal-n 20 -o OUT_rnafill -t 16
+# assemble OUT_rnafill/rnafill.recruit_*.fastq with any assembler
+# (e.g. Trinity), then fill:
+nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
+    -T assembled.fa -o OUT_rnafill -t 16 \
+    --internal-n 20 --fill-mode exon-only --one-sided
+```
+
+(`--fill-mode exon-only` is recommended together with `--internal-n`:
+component-internal N runs usually cover introns, and cDNA fills would
+compress them out and distort downstream ab initio annotation.)
+
+Same recruitment design as gapfill (mini reference of the two ~2 kb
+flanks of every eligible gap, minimap2 with a splice preset), but the
+evidence is cDNA: a transcript hitting both flanks contributes its
+middle segment. A near-zero middle means the two flanks are adjacent
+exons — the gap is (mostly) intronic — and is closed by abutting
+(`--fill-mode cdna`, default) or left open (`--fill-mode exon-only`).
+exon-only also skips gaps whose visible edges look like canonical
+splice sites (GT..AG on either strand).
+
+Options: `--fill-mode {cdna,exon-only}`; `--tx-preset` (default
+`splice:hq`; use `splice` for noisy cDNA); `--tx-min-span INT`;
+`--abut-window INT` (default 30); `--max-depth-factor FLOAT` (multi-
+copy gene families piling up transcripts are rejected, default 3.0, 0
+disables); `--no-overlap-closure`; `--fill-tiers` (default
+`protein,asm5`); `--one-sided` (when a transcript covers one gap edge
+and extends >=500 bp into the gap, write the covered sequence next to
+that flank and leave a residual gap); `--internal-n LEN` (also fill N
+runs >= LEN bp *inside* components — short-read assemblies carry
+estimated-length N runs within their scaffolds; HiFi assemblies have
+none; default 0 disables). Requires `minimap2` on `PATH`.
+
+Outputs: `nearscaff.rnafill.agp` and `nearscaff.rnafill.scaffolds.fa`
+(fill components are named `*_gapfill_tx*`), plus a report split by
+span / abut / overlap closures and intronic skips.
+
+> **NOTE — fills are cDNA.** In the default `cdna` mode the inserted
+> sequence is real exonic sequence, but introns inside a closed gap are
+> compressed out. Use the output to improve annotation completeness
+> (gene models, BUSCO-protein, lifted transcripts); do not use it for
+> analyses that need true intronic sequence. Use `--fill-mode
+> exon-only` when only certainly-exonic gaps should be touched.
+
 ## Outputs
 
 Written to the output directory:

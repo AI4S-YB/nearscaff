@@ -85,6 +85,117 @@ Stage 1 额外选项：`--margin`（比对区域外延长度，默认 50000）�
 `--unknown-gap-size`（默认 100），以及上文提到的
 `--nucleotide-passes`、`--secondary-alignments`、`--no-reuse-index`。
 
+## 用长读长填充 gap（gapfill）
+
+`nearscaff gapfill` 用长读长（HiFi/ONT）选择性地关闭 scaffold 中的
+gap。只有两翼都是高置信 contig 的 gap 才会被填充——置信层级取自
+`nearscaff_tiered.paf`，默认为 `protein`/`asm5`；触及低置信
+（`asm20`）挂载的 gap 保持为 N。填充只替换 N 串、绝不改变
+scaffold 拓扑。
+
+工作原理：为每个可填 gap 的两翼各 ~1.5 kb flank 建一个迷你参考，
+用 minimap2 把长读长比对上去，两种闭合方式——横跨两翼的 reads
+（取跨越段的中位长度 consensus），以及两翼 clip 尾巴互相 overlap
+（dovetail 重叠，且重叠段必须唯一比对到 scaffold 上的单一基因座，
+以此过滤重复序列造成的假闭合）。
+
+```bash
+nearscaff gapfill -a OUT/nearscaff.agp -q QUERY.fa \
+    -r hifi.fastq.gz -o OUT_gapfill -t 16
+```
+
+选项：`--lr-preset {map-hifi,map-ont}`（默认 `map-hifi`）；
+`--lr-min-span INT` —— 每个 span 闭合的最少横跨 reads（默认 1）；
+`--max-depth-factor FLOAT` —— 跨越深度超过中位数 N 倍的 gap 拒绝
+闭合（重复塌缩；默认 3.0，0 关闭）；`--no-overlap-closure` —— 只做
+span 闭合；`--fill-tiers` —— 可填的两翼层级（默认 `protein,asm5`）。
+需要 PATH 中有 `minimap2`。
+
+输出：`nearscaff.gapfill.agp` 与 `nearscaff.gapfill.scaffolds.fa`，
+以及填充报告（可填 / 闭合数、填补碱基数，区分 span 与 overlap）。
+
+### 短读长模式（`--method sr`）
+
+也支持二代双端数据（`-1/-2`）。三种机制：单 read 横跨闭合（微小
+gap 的精确序列）、双端尾巴 overlap 闭合（拼接后的配对序列，不做
+唯一性过滤）、PE 双端 gap 缩放（AGP gap 长度替换为基于插入片段的
+估计值，类型 `N`、证据 `paired-ends`；`--sr-insert` 设定名义插入
+片段，默认 500）。
+
+> **注意——假阳性率高。** contig 末端是串联重复，短读长证据在
+> 那里被多拷贝假象主导。在真实碎片化组装上，sr 模式的序列闭合率
+> 约为可填 gap 的 0.1~0.6%（另有数百个 gap 获得尺寸估计）。请为
+> 闭合率而用它，不要为正确率；有长读长时优先长读长。
+
+注：短读长盲搜方案（abyss-sealer Bloom 游走、clip 延伸）经过实测
+已被移除——真实数据上 0 闭合。锚定在串联重复上的 gap 用任何读长
+都无法可靠填充；可闭合的主要集中在真实 gap 较小或连接处为唯一
+序列的情形。
+
+## 用转录本填充基因区 gap（rna-fill）
+
+`nearscaff rna-fill` 闭合对注释最重要的 gap：基因区内的那些。
+scaffold 化后的基因组 BUSCO 可以很高，但基因区仍然布满 N 串，导致
+下游注释（miniprot 等）只能得到破碎的基因模型。rna-fill 把转录本
+序列比对回 scaffold，填补转录本能够跨越的 gap。
+
+输入转录本可以是 Iso-Seq、ONT cDNA 或组装好的转录本
+（FASTA/FASTQ）。短读长 RNA-seq 必须先组装（如 Trinity）——单条
+短读长无法跨越 gap。
+
+```bash
+nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
+    -T transcripts.fa -o OUT_rnafill -t 16
+```
+
+**定向招募 reads 再做组装。** 只有二代 RNA-seq 时，可以只组装
+"有用的" reads：`--reads` + `--proteins` 会构建组合诱饵（gap flank
+——含 `--internal-n` 炸开的组件内 N run——加上**残缺基因位点**：
+miniprot 预测出的翻译含 X 的 mRNA，即 CDS 穿过 N 串的位点）并提取
+招募 reads 及其 mate：
+
+```bash
+nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
+    --reads RNA_R1.fq.gz RNA_R2.fq.gz --proteins REF.pep.fa \
+    --internal-n 20 -o OUT_rnafill -t 16
+# 用任意组装器（如 Trinity）组装 OUT_rnafill/rnafill.recruit_*.fastq，
+# 然后填充：
+nearscaff rna-fill -a OUT/nearscaff.agp -q QUERY.fa \
+    -T assembled.fa -o OUT_rnafill -t 16 \
+    --internal-n 20 --fill-mode exon-only --one-sided
+```
+
+（`--internal-n` 建议搭配 `--fill-mode exon-only`：组件内 N 串多数
+盖住内含子，cdna 模式会把内含子压没，扭曲下游 de novo 注释。）
+
+与 gapfill 相同的招募设计（每个可填 gap 两翼 ~2 kb flank 建迷你
+参考，minimap2 splice 预设比对），但证据是 cDNA：同时命中两翼的
+转录本贡献其中间段。中间段接近零说明两翼是相邻外显子——gap
+（基本）是内含子——默认 `--fill-mode cdna` 下直接对接（abut），
+`--fill-mode exon-only` 下则保持开放。exon-only 还会跳过边缘
+带有经典剪接位点（任一链上的 GT..AG）的 gap。
+
+选项：`--fill-mode {cdna,exon-only}`；`--tx-preset`（默认
+`splice:hq`，噪声大的 cDNA 用 `splice`）；`--tx-min-span INT`；
+`--abut-window INT`（默认 30）；`--max-depth-factor FLOAT`（拒绝
+多拷贝基因家族堆积转录本的 gap，默认 3.0，0 关闭）；
+`--no-overlap-closure`；`--fill-tiers`（默认 `protein,asm5`）；
+`--one-sided`（单侧延伸：转录本盖住一侧边缘并伸进 gap ≥500 bp 时
+贴着该侧写出已知序列，残余 gap 保留）；`--internal-n LEN`（同时填充
+组件内部 ≥LEN bp 的 N 串——短读组装的 scaffold 内部有大量估计长度的
+N，HiFi 组装没有，默认 0 关闭）。
+需要 `PATH` 上有 `minimap2`。
+
+输出：`nearscaff.rnafill.agp` 和 `nearscaff.rnafill.scaffolds.fa`
+（填充 component 命名为 `*_gapfill_tx*`），另有按 span / abut /
+overlap 闭合与内含子跳过分类的统计报告。
+
+> **注意——填充物是 cDNA。** 默认 `cdna` 模式下填入的是真实的外
+> 显子序列，但闭合 gap 内的内含子会被压缩丢掉。输出可用于提升注
+> 释完整性（基因模型、BUSCO 蛋白、转录本回贴），但不要用于需要
+> 真实内含子序列的分析。只动确定是外显子的 gap 时用
+> `--fill-mode exon-only`。
+
 ## 输出
 
 输出目录中的文件：
