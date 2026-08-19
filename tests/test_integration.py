@@ -128,6 +128,29 @@ class TestPipelineUnit:
         assert parsed[0].component_id == "ctg1"
         assert parsed[1].gap_length == 100
 
+    def test_append_unplaced_singletons(self):
+        """--keep-unplaced: contigs absent from the AGP become singleton
+        scaffolds named after the contig; placed contigs untouched."""
+        from nearscaff.agp import AGPSeqLine, AGPGapLine
+        from nearscaff.pipeline import _append_unplaced_singletons
+
+        lines = [
+            AGPSeqLine("nearscaff_0001", 1, 1000, 1, "W", "ctg1", 1, 1000, "+"),
+            AGPGapLine("nearscaff_0001", 1001, 1100, 2, "N", 100,
+                       "scaffold", "yes", "align_genus"),
+            AGPSeqLine("nearscaff_0001", 1101, 2000, 3, "W", "ctg2", 1, 900, "+"),
+        ]
+        lengths = {"ctg1": 1000, "ctg2": 900, "ctg3": 500, "ctg4": 50}
+        out = _append_unplaced_singletons(lines, lengths, 0)
+        assert len(out) == 5          # ctg3 + ctg4 appended
+        singletons = out[3:]
+        assert [l.object_name for l in singletons] == ["ctg3", "ctg4"]
+        assert all(l.component_id == l.object_name and l.orientation == "+"
+                   for l in singletons)
+        # min_len filters small contigs
+        out = _append_unplaced_singletons(lines, lengths, 100)
+        assert [l.object_name for l in out[3:]] == ["ctg3"]
+
 
 # ---------------------------------------------------------------------------
 # Integration tests (require external tools)

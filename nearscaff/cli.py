@@ -33,6 +33,11 @@ def main():
                        help="INTERLEAVED overlap threshold (default: 0.5)")
     p_run.add_argument("--no-best-buddy", action="store_true",
                        help="Disable best-buddy weight scaling")
+    p_run.add_argument("--keep-unplaced", type=int, nargs="?", const=0,
+                       default=None, metavar="MINLEN",
+                       help="Append query contigs that never entered a "
+                       "scaffold as singleton AGP rows (default: off; "
+                       "optional MINLEN keeps only contigs >= MINLEN bp)")
     p_run.add_argument("--nucleotide-passes", nargs="*",
                        default=["asm5", "asm20"],
                        choices=["asm5", "asm10", "asm15", "asm20"],
@@ -58,6 +63,11 @@ def main():
                         help="Alignment region margin in bp (default: 50000)")
     p_scaf.add_argument("--no-best-buddy", action="store_true",
                         help="Disable best-buddy weight scaling")
+    p_scaf.add_argument("--keep-unplaced", type=int, nargs="?", const=0,
+                        default=None, metavar="MINLEN",
+                        help="Append query contigs that never entered a "
+                        "scaffold as singleton AGP rows (default: off; "
+                        "optional MINLEN keeps only contigs >= MINLEN bp)")
     p_scaf.add_argument("--unknown-gap-size", type=int, default=100,
                         help="Default unknown gap size (default: 100)")
     p_scaf.add_argument("--nucleotide-passes", nargs="*",
@@ -319,6 +329,8 @@ def _build_config(args) -> NearscaffConfig:
         config.scaffold.unknown_gap_size = args.unknown_gap_size
     if hasattr(args, "no_best_buddy") and args.no_best_buddy:
         config.scaffold.best_buddy_scale = False
+    if hasattr(args, "keep_unplaced"):
+        config.scaffold.keep_unplaced = args.keep_unplaced
     if hasattr(args, "preset") and args.preset:
         preset = DIVERGENCE_PRESETS[args.preset]
         config.protein.splice_model = preset["miniprot_j"]

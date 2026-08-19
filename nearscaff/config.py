@@ -51,6 +51,8 @@ class ScaffoldConfig:
     unknown_gap_size: int = 100
     candidate_scaling: float = 0.75
     best_buddy_scale: bool = True
+    keep_unplaced: int | None = None  # None=off; else min contig length
+                                      # (0 = append every unplaced contig)
 
 
 @dataclass

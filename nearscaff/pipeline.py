@@ -590,6 +590,9 @@ def run_stage1(config: NearscaffConfig, block_tree_path: str,
                                    contig_ref=contig_ref,
                                    contig_strand=contig_strand,
                                    contig_mapq=contig_mapq)
+    if config.scaffold.keep_unplaced is not None:
+        agp_lines = _append_unplaced_singletons(
+            agp_lines, contig_lengths, config.scaffold.keep_unplaced)
 
     agp_path = os.path.join(output_dir, "nearscaff.agp")
     writer = AGPWriter()
@@ -1662,3 +1665,31 @@ def _extract_agp_paths(cover, contig_lengths: dict,
         scaffold_idx += 1
 
     return lines
+
+
+def _append_unplaced_singletons(agp_lines: list, contig_lengths: dict,
+                                min_len: int) -> list:
+    """Append query contigs absent from the AGP as singleton scaffolds.
+
+    Contigs that never entered the scaffold graph (no protein block, no
+    nucleotide extension hit) would otherwise vanish from the assembly
+    output entirely — for hyper-fragmented queries that can be a sizable
+    fraction of the genome, silently hurting downstream completeness
+    metrics.  With ``scaffold.keep_unplaced`` set, each such contig
+    (>= *min_len* bp) becomes a one-line AGP scaffold named after the
+    contig itself.
+    """
+    from nearscaff.agp import AGPSeqLine
+
+    placed = {l.component_id for l in agp_lines
+              if isinstance(l, AGPSeqLine)}
+    out = list(agp_lines)
+    n = 0
+    for ctg, ln in sorted(contig_lengths.items()):
+        if ctg in placed or ln < min_len:
+            continue
+        out.append(AGPSeqLine(ctg, 1, ln, 1, "W", ctg, 1, ln, "+"))
+        n += 1
+    logger.info("keep-unplaced: %d unplaced contigs appended as singleton "
+                "scaffolds (min length %d bp)", n, min_len)
+    return out
