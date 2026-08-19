@@ -942,7 +942,8 @@ def plan_placements(brackets: dict, ref_genes: dict, gene_tx: dict,
             seq = tx_seqs.get(txn)
             if seq is None:
                 continue
-            gblocks = build_gene_placement(seq, paf, r0, r1)
+            gblocks = build_gene_placement(seq, paf, r0, r1,
+                                           max_spacer=max_spacer)
             if gblocks:
                 placed.append((gb, ge, gid, txn, gblocks))
         if not placed:
@@ -995,7 +996,8 @@ def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
                 place_max_bracket: int = PLACE_MAX_BRACKET,
                 place_max_genes: int = PLACE_MAX_GENES,
                 place_min_ovlp: float = PLACE_MIN_OVLP,
-                place_intact_cov: float = PLACE_INTACT_COV) -> dict:
+                place_intact_cov: float = PLACE_INTACT_COV,
+                place_max_spacer: int = PLACE_MAX_SPACER) -> dict:
     """Transcript-guided filling of genic gaps via flank recruitment.
 
     *transcripts* is a list of FASTA/FASTQ(.gz) files (Iso-Seq, ONT cDNA
@@ -1186,7 +1188,7 @@ def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
                 transcripts, {txn for txn, _p in gene_tx.values()})
             place_idx, pdetail = plan_placements(
                 brackets, ref_genes, gene_tx, tx_seqs,
-                max_genes=place_max_genes)
+                max_genes=place_max_genes, max_spacer=place_max_spacer)
             idx_to_gid = {i: g for g, i in gid_to_idx.items()}
             for gidx, metas in pdetail.items():
                 for gene_id, txn, nb in metas:

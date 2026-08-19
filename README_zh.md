@@ -204,8 +204,9 @@ N，HiFi 组装没有，默认 0 关闭）；`--ref REF.fa` + `--ref-gff GFF3` /
 `--proteins`（参考位置引导的整基因放置；`--place-max-bracket`
 默认 1 Mb，`--place-max-genes` 默认 50，`--place-min-ovlp`
 默认 0.5；`--place-intact-cov` 默认 0.8——蛋白在 query 中已有
-完整命中（无 X）的参考基因不重复放置，防旁系/挂载错位造重复）。
-需要 `PATH` 上有 `minimap2`。
+完整命中（无 X）的参考基因不重复放置，防旁系/挂载错位造重复；
+`--place-max-spacer` 默认 50000，截断参考估计的内含子/基因间 N
+占位长度）。需要 `PATH` 上有 `minimap2`。
 
 输出：`nearscaff.rnafill.agp` 和 `nearscaff.rnafill.scaffolds.fa`
 （填充 component 命名为 `*_gapfill_tx*`），另有按 span / abut /

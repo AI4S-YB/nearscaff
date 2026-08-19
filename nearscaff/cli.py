@@ -260,6 +260,12 @@ def main():
                       "protein already maps intact to the query "
                       "(coverage >= this, no X) is not placed again "
                       "(default: 0.8)")
+    p_rf.add_argument("--place-max-spacer", type=int, default=50000,
+                      metavar="BP",
+                      help="Ref-guided placement: cap ref-derived "
+                      "intron/intergenic spacer lengths at this size "
+                      "(default: 50000; shorter caps help miniprot span "
+                      "the placeholder N)")
 
     args = parser.parse_args()
 
@@ -525,7 +531,8 @@ def _cmd_rnafill(args):
             place_max_bracket=args.place_max_bracket,
             place_max_genes=args.place_max_genes,
             place_min_ovlp=args.place_min_ovlp,
-            place_intact_cov=args.place_intact_cov)
+            place_intact_cov=args.place_intact_cov,
+            place_max_spacer=args.place_max_spacer)
     except (ValueError, RuntimeError) as e:
         logging.getLogger("nearscaff").error("rna-fill failed: %s", e)
         sys.exit(1)

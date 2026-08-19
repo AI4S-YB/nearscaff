@@ -530,6 +530,17 @@ def test_build_gene_placement_plus(tmp_path):
     assert blocks == ["A" * 100, "GT" + "N" * 46 + "AG", "C" * 200]
 
 
+def test_build_gene_placement_max_spacer():
+    tx = "A" * 100 + "C" * 200
+    p = _tx_paf_fields(1000, 1350, "100M50N200M")
+    # unclipped intron longer than max_spacer is truncated, splice
+    # consensus edges are kept
+    blocks = build_gene_placement(tx, p, 900, 2000, max_spacer=20)
+    assert blocks == ["A" * 100, "GT" + "N" * 16 + "AG", "C" * 200]
+    # default cap leaves the 50 bp intron untouched
+    assert build_gene_placement(tx, p, 900, 2000)[1] == "GT" + "N" * 46 + "AG"
+
+
 def test_build_gene_placement_clipped_to_bracket():
     tx = "A" * 100 + "C" * 200
     p = _tx_paf_fields(1000, 1350, "100M50N200M")

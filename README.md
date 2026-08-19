@@ -239,7 +239,9 @@ none; default 0 disables); `--ref REF.fa` + `--ref-gff GFF3` /
 default 1 Mb, `--place-max-genes` default 50, `--place-min-ovlp`
 default 0.5; `--place-intact-cov` default 0.8 — a reference gene whose
 protein already has an intact, X-free hit anywhere in the query is not
-placed again, guarding against paralog / misplacement duplicates). Requires `minimap2` on `PATH`.
+placed again, guarding against paralog / misplacement duplicates;
+`--place-max-spacer` default 50000 caps the ref-derived intron /
+intergenic N-placeholder lengths). Requires `minimap2` on `PATH`.
 
 Outputs: `nearscaff.rnafill.agp` and `nearscaff.rnafill.scaffolds.fa`
 (fill components are named `*_gapfill_tx*`), plus a report split by
