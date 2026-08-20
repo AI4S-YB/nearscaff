@@ -72,6 +72,11 @@ GFF3 annotation. Useful options:
 - `--min-cluster-size INT` — minimum anchors per synteny block (default 4)
 - `--overlap-threshold FLOAT` — block overlap threshold (default 0.5)
 - `--no-best-buddy` — disable best-buddy weight scaling in graph solving
+- `--keep-unplaced [MINLEN]` — append query contigs that never entered a
+  scaffold as singleton AGP rows named after the contig (default: off;
+  with MINLEN keep only contigs ≥ MINLEN bp). Hyper-fragmented queries
+  can otherwise lose a sizable fraction of the assembly from the output,
+  silently hurting downstream completeness metrics
 - `--nucleotide-passes asm5 asm20` — nucleotide extension passes
   (default `asm5 asm20`; pass `asm5 asm10 asm20` for the pre-0.3.1
   behavior)
@@ -97,8 +102,8 @@ nearscaff scaffold -b OUT/block_tree.json -r REF.fa -q QUERY.fa -o OUT2 -t 16
 
 Additional Stage 1 options: `--margin` (alignment region padding,
 default 50000), `--unknown-gap-size` (default 100),
-`--nucleotide-passes`, `--secondary-alignments` and `--no-reuse-index`
-(as above).
+`--keep-unplaced [MINLEN]` (as above), `--nucleotide-passes`,
+`--secondary-alignments` and `--no-reuse-index` (as above).
 
 ## Gap filling with long reads (gapfill)
 
@@ -445,6 +450,33 @@ resolvable homeolog blocks ≥ 500 kb, the better the genome-wide result
 output is flagged or withheld rather than reported confidently.
 
 ## Changelog
+
+### Unreleased
+
+- **`rna-fill` — transcript-guided filling of genic gaps.** Short-read
+  or assembled transcripts are recruited by the gap flanks; span
+  closures, splice-aware abut/overlap handling, `--one-sided`
+  extensions, `--internal-n` for N runs inside contigs, and
+  `--fill-mode {cdna,exon-only}`.
+- **Ref-guided whole-gene placement (`rna-fill --ref`).** Gaps no
+  flank-based mechanism can reach (an entire gene locus is N) are
+  bracketed on a reference genome via the flanking contigs; reference
+  genes inside the bracket (`--ref-gff`, or miniprot-derived from
+  `--proteins`) are matched to transcripts and written into the gap in
+  reference order — real exon sequence with GT..AG-edged intron
+  placeholders. An intact-protein anti-duplication check
+  (`--place-intact-cov`) skips genes already present in the query;
+  `--place-max-bracket/-genes/-min-ovlp/-max-spacer` tune the rest.
+- **Ref fill-check (`--ref`, on by default).** Long span/extension
+  fills (≥500 bp) are validated against the reference: a fill whose
+  best hit lands outside its gap's ref bracket (±50 kb) is rejected as
+  likely paralog contamination and falls through to placement
+  (`--no-fill-check` disables).
+- **`gapfill` — long-read gap closing** (`--method sr/lr/endjoin`).
+- **`--keep-unplaced [MINLEN]`.** Query contigs that never enter the
+  scaffold graph are appended to the AGP as singleton scaffolds named
+  after the contig (default: off) — hyper-fragmented queries otherwise
+  lose a sizable fraction of the assembly from the output.
 
 ### 0.3.1
 

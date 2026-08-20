@@ -61,6 +61,10 @@ nearscaff run -r REF.fa -p PROTEINS.pep -q QUERY.fa -o OUT -t 16 --preset near
 - `--min-cluster-size INT` —— 每个共线性区块的最少锚点数（默认 4）
 - `--overlap-threshold FLOAT` —— 区块重叠阈值（默认 0.5）
 - `--no-best-buddy` —— 关闭图求解中的 best-buddy 权重缩放
+- `--keep-unplaced [MINLEN]` —— 把从未进入 scaffold 的 query contig
+  以原名 singleton 行追加进 AGP（默认关闭；带 MINLEN 时只保留
+  ≥MINLEN bp 的）。高度碎片化的 query 若不开启，相当比例的组装
+  序列会从输出中丢失，悄悄拉低下游完整性指标
 - `--nucleotide-passes asm5 asm20` —— 核苷酸扩展轮次（默认
   `asm5 asm20`；传入 `asm5 asm10 asm20` 可还原 0.3.1 之前的行为）
 - `--secondary-alignments INT` —— 扩展轮保留的 minimap2 `-N` 次级
@@ -82,8 +86,9 @@ nearscaff scaffold -b OUT/block_tree.json -r REF.fa -q QUERY.fa -o OUT2 -t 16
 > 理想，多跑一两次通常能得到更优的解。
 
 Stage 1 额外选项：`--margin`（比对区域外延长度，默认 50000）、
-`--unknown-gap-size`（默认 100），以及上文提到的
-`--nucleotide-passes`、`--secondary-alignments`、`--no-reuse-index`。
+`--unknown-gap-size`（默认 100）、`--keep-unplaced [MINLEN]`（同上），
+以及上文提到的 `--nucleotide-passes`、`--secondary-alignments`、
+`--no-reuse-index`。
 
 ## 用长读长填充 gap（gapfill）
 
@@ -389,6 +394,28 @@ contig 准确率高，说明分错的主要是短 contig：案例 A 中基因组
 置信度低的输出会被如实标注或拒判。
 
 ## 更新日志
+
+### 未发布
+
+- **`rna-fill`：转录组引导的基因区 gap 填补。** 由 gap 两翼招募
+  转录本（短读组装或现成转录本）；支持 span 闭合、剪接感知的
+  abut/overlap 处理、`--one-sided` 单侧延伸、`--internal-n`（炸开
+  contig 内部 N 串）和 `--fill-mode {cdna,exon-only}`。
+- **参考位置引导的整基因放置（`rna-fill --ref`）。** flank 机制
+  无法触达的 gap（整个基因座全是 N）借两翼 contig 的比对括到参考
+  基因组上；括号内的参考基因（`--ref-gff`，或用 `--proteins` 经
+  miniprot 推导）匹配转录本后按参考顺序写入——真实外显子序列 +
+  带 GT..AG 剪接边的内含子占位。intact 反重复检查
+  （`--place-intact-cov`）跳过 query 中已存在的基因；其余用
+  `--place-max-bracket/-genes/-min-ovlp/-max-spacer` 调节。
+- **fill-check 后置校验（`--ref` 时默认开启）。** ≥500 bp 的
+  span/延伸填充会对参考做校验：最优命中落在 gap 参考括号之外
+  （±50 kb）的判为疑似旁系污染并驳回，gap 回落给放置机制
+  （`--no-fill-check` 关闭）。
+- **`gapfill`：长读 gap 闭合**（`--method sr/lr/endjoin`）。
+- **`--keep-unplaced [MINLEN]`。** 从未进图的 query contig 以原名
+  singleton 追加进 AGP（默认关闭）——高度碎片化的 query 否则会
+  从输出中丢失相当比例的组装序列。
 
 ### 0.3.1
 
