@@ -160,6 +160,22 @@ real data. Gaps anchored in tandem repeats remain unfillable with any
 read type; expect closures mainly where the true gap is small or the
 junction is unique sequence.
 
+### Measured effectiveness
+
+Real plant assemblies (16 threads):
+
+- **lr mode (HiFi), ~200 Mb plant assembly**: 75–104 of 1,001 eligible
+  gaps closed with ~0.9 Mb of real sequence (median fill 7 kb); the
+  uniqueness gate rejected 46/64 overlap candidates as repeat-driven
+  pseudo-closures.
+- **end-join** (overlapping gap ends joined directly, no new sequence):
+  the highest-yield mechanism on fragmented assemblies — 2,852 joins on
+  a ~560 Mb fragmented plant genome and 360 on a ~460 Mb plant genome
+  (11x its sequence closures).
+- **sr mode** (~460 Mb / ~560 Mb plant genomes): 97 / 257 sequence
+  closures plus 267 / 585 PE-resized gaps — see the false-positive
+  caution above.
+
 ## Filling genic gaps with transcripts (rna-fill)
 
 `nearscaff rna-fill` closes the gaps that matter most for annotation:
