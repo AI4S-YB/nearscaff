@@ -572,6 +572,29 @@ and BUSCO completeness equal or better:
 | Example 1 (fragmented) | C:92.1% [S:90.1%, D:2.0%], F:5.4%, M:2.5% | **C:95.1%** [S:92.8%, D:2.4%], F:3.8%, M:1.1% |
 | Example 2 (long-read) | C:97.6% [S:95.5%, D:2.0%], F:1.7%, M:0.7% | **C:98.0%** [S:95.6%, D:2.4%], F:1.9%, M:0.1% |
 
+### 0.2.0
+
+Coordinate-based ordering and orientation confidence for scaffold
+components (fragments are re-ordered against the reference instead of
+keeping raw graph order):
+
+- Scaffold components are ordered by refined reference midpoint;
+  contigs without reference coordinates keep their graph order,
+  interpolated between anchored neighbours (replacing the old
+  whole-scaffold flip normalization).
+- Each scaffold's direction is normalized to increasing reference
+  coordinates, and each component is oriented by its best alignment
+  (longest block, then mapq); traversal inference is kept as a fallback
+  for unaligned contigs, and orientations supported only by
+  low-confidence alignments (mapq < 10) are reported as `?` in the AGP.
+- The tiered PAF writes real strands instead of a hardcoded `+`.
+
+This was found and fixed while scaffolding a real plant genome whose
+chromosomes came out partly reverse-oriented: orientation concordance
+with the reference went from 50% (coin flip) to 96.6% / 94.1% on the
+two plant benchmark assemblies, and chromosome-scaffold BUSCO from
+85.0% to 92.1% (Example 1) and 97.4% to 97.6% (Example 2).
+
 ## Development
 
 Run the test suite (integration tests are skipped automatically when
