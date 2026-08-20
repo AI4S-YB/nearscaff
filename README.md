@@ -269,7 +269,8 @@ Measured on the real-world datasets in this repository (16–24 threads;
 wall time / peak memory where recorded).
 
 **gapfill (DNA fill), short-read mode, 16 threads** — two plant
-assemblies (lenta 16,649 gaps / nana, fragmented):
+assemblies (a plant genome with 16,649 gaps and a fragmented plant
+genome):
 
 | step | time | peak RSS |
 |---|---|---|
@@ -278,11 +279,12 @@ assemblies (lenta 16,649 gaps / nana, fragmented):
 | minimap2 map-hifi 1.3M reads (whole genome) | 266 s | 1.4 GB |
 | minimap2 vs flank mini-reference (HiFi) | 194 s | 0.95 GB |
 | minimap2 `-x sr` 16.7M reads vs flank mini-reference | 35 s | 0.26 GB |
-| **full SR-mode run (lenta / nana)** | **105 / 190 min** | ≤6 GB (bloom) |
+| **full SR-mode run (two plant assemblies)** | **105 / 190 min** | ≤6 GB (bloom) |
 
-**rna-fill, 24 threads** — worst case in our campaigns (petraea:
-290,735 gaps from a 281k-contig assembly, 25k transcripts, 120–190 Mb
-reference, `--ref` placement + fill-check):
+**rna-fill, 24 threads** — worst case in our campaigns (a
+hyper-fragmented plant assembly: 290,735 gaps from a 281k-contig
+assembly, 25k transcripts, 120–190 Mb reference, `--ref` placement +
+fill-check):
 
 | step | time |
 |---|---|
@@ -513,8 +515,9 @@ New subcommands and output-completeness/correctness features over 0.3.1:
   after the contig (default: off) — hyper-fragmented queries otherwise
   lose a sizable fraction of the assembly from the output.
 
-Validated on a hyper-fragmented real assembly (A. lyrata, 281k contigs,
-re-scaffolded against the chromosome-level ALyr reference): 95–96% of
+Validated on a hyper-fragmented real plant assembly (281k contigs,
+re-scaffolded against a chromosome-level reference of the same
+species): 95–96% of
 short fills and ~95% of placed-gene introns land at the correct
 reference locus; the fill-check rejects 27.5% of long fills (mostly
 paralogs) and lifts fill/reference locus concordance from 82.6% to
