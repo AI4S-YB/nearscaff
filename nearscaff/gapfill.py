@@ -16,10 +16,15 @@ Recipe (validated on a HiFi benchmark):
      scaffolds (repeat-overlap pseudo-closures are the dominant failure
      mode and are filtered out)
 """
+import contextlib
+import functools
 import gzip
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
+from concurrent.futures import ProcessPoolExecutor
 
 from nearscaff.agp import AGPSeqLine, AGPGapLine, AGPReader, AGPWriter
 
@@ -313,6 +318,19 @@ def _write_fasta_record(f, name: str, chunks: list) -> None:
 LR_FLANK = 1500
 LR_MIN_CLIP = 300
 LR_EDGE = 10
+# sr closure thresholds shared by _sr_collect's Python loop and its awk
+# prefilter (single source of truth -- the awk script is generated from them)
+SPAN_SHORTFALL = 300
+PE_MIN_MAPQ = 20
+
+
+@functools.lru_cache(maxsize=1)
+def _find_awk() -> str | None:
+    """First awk on PATH (mawk preferred: fastest field splitting)."""
+    for cand in ("mawk", "awk"):
+        if shutil.which(cand):
+            return cand
+    return None
 LR_MAX_TAILS = 30
 LR_MIN_OVLP = 500
 LR_MIN_OVLP_IDENT = 0.85
@@ -389,15 +407,25 @@ def run_minimap2(target_fa: str, reads: list, out_paf: str, preset: str,
 
 def _fetch_read_seqs(fastqs, wanted: set) -> dict:
     """Fetch {name: seq} for *wanted* read names from FASTQ/FASTA(.gz)
-    files (format auto-detected per file from the first record)."""
+    files (format auto-detected per file from the first record).
+
+    .gz inputs are decompressed by an external ``gzip -dc`` process (runs in
+    C, far faster than Python's gzip framing on multi-GB inputs); Python only
+    parses the read lines."""
     seqs: dict[str, str] = {}
     if isinstance(fastqs, str):
         fastqs = [fastqs]
     for fq in fastqs:
         if not wanted - set(seqs):
             break
-        opener = gzip.open if fq.endswith(".gz") else open
-        with opener(fq, "rt") as f:
+        proc = None
+        if fq.endswith(".gz"):
+            proc = subprocess.Popen(["gzip", "-dc", fq], stdout=subprocess.PIPE,
+                                    text=True, bufsize=1 << 20)
+            f = proc.stdout
+        else:
+            f = open(fq, "rt")
+        try:
             h = f.readline()
             if h.startswith(">"):                # FASTA (multi-line)
                 name = h[1:].split()[0]
@@ -424,7 +452,546 @@ def _fetch_read_seqs(fastqs, wanted: set) -> dict:
                     if name in wanted:
                         seqs[name] = seq
                     h = f.readline()
+        finally:
+            f.close()
+            if proc is not None:
+                proc.wait()
     return seqs
+
+
+def _read_flank_paf(paf_path: str) -> list:
+    """One-pass parse of a flank mini-reference PAF into alignment records.
+
+    Returns [(qn, ql, qs, qe, strand, tn, tl, ts, te, mapq, is_primary), ...]
+    for mapped rows only.  Shared across parse_span_fills / parse_tails /
+    parse_pe_spans so each PAF is read once, not three times (the sr/10x
+    bottleneck when the PAF is GB-scale from minimap2 -N).
+    """
+    out = []
+    with open(paf_path) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 12 or p[2] == "*" or p[5] == "*":
+                continue
+            out.append((p[0], int(p[1]), int(p[2]), int(p[3]), p[4],
+                        p[5], int(p[6]), int(p[7]), int(p[8]), int(p[11]),
+                        "tp:A:P" in p[12:]))
+    return out
+
+
+@contextlib.contextmanager
+def _paf_edge_lines(paf_path: str, flank_len: dict, with_pe: bool):
+    """Iterate the flank-PAF lines _sr_collect can use, prefiltered by an
+    awk subprocess (C-speed field tests; ~70% of 10x-scale lines are
+    mid-flank noise Python would parse and discard).  flank_len is
+    preloaded into an awk array because the tail test keys off flank_len,
+    which synthetic PAFs may not mirror in tl.  Falls back to the raw file
+    when no awk is on PATH."""
+    awk = _find_awk()
+    proc = tsv = None
+    try:
+        if awk is None:
+            with open(paf_path) as f:
+                yield f
+            return
+        fd, tsv = tempfile.mkstemp(suffix=".gapfill.flanklen.tsv")
+        with os.fdopen(fd, "w") as f:
+            f.writelines(f"{n}\t{l}\n" for n, l in flank_len.items())
+        pe = (f" || ($12 >= {PE_MIN_MAPQ} && index($0, \"\\ttp:A:P\"))"
+              if with_pe else "")
+        script = (
+            'FILENAME == ARGV[1] { L[$1] = $2; next }\n'
+            'NF >= 12 && $3 != "*" && $6 != "*" {\n'
+            '  fl = ($6 in L) ? L[$6] : $7\n'
+            f'  if (($6 ~ /\\|L$/ && ($9 >= $7 - {SPAN_SHORTFALL}'
+            f'      || ($9 - fl <= {LR_EDGE} && $9 - fl >= -{LR_EDGE})))'
+            f'      || ($6 ~ /\\|R$/ && $8 <= {SPAN_SHORTFALL}){pe})\n'
+            '    print\n'
+            '}\n')
+        proc = subprocess.Popen(
+            [awk, "-F", "\t", script, tsv, paf_path],
+            stdout=subprocess.PIPE, text=True, bufsize=1 << 20)
+        yield proc.stdout
+        proc.stdout.close()
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"{awk} PAF prefilter failed (rc={rc})")
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        if tsv is not None:
+            try:
+                os.unlink(tsv)
+            except OSError:
+                pass
+
+
+def _sr_collect(paf_path: str, flank_len: dict, min_clip: int, max_tails: int,
+                with_pe: bool):
+    """One streaming pass over a flank PAF (module-level -> picklable for the
+    parallel sr path).  Returns (span_hits, pe_hits, tail_events, usable_qns)
+    without holding a records list."""
+    span_hits: dict = {}                  # (gid,qn) -> {side:(strand,qs,qe,ts,te)}
+    pe_hits: dict = {}                    # qn -> {tn:(strand,ts,te,tl)}
+    tail_events: dict = {}                # gid -> {"L":[(qn,pos,strand)],"R":[...]}
+    tail_qns: set = set()
+    with _paf_edge_lines(paf_path, flank_len, with_pe) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 12 or p[2] == "*" or p[5] == "*":
+                continue
+            qn, ql, qs, qe = p[0], int(p[1]), int(p[2]), int(p[3])
+            strand, tn = p[4], p[5]
+            tl, ts, te = int(p[6]), int(p[7]), int(p[8])
+            # parse mapq/primary only when PE needs them; skips int()+list-in
+            # per row on 100M+ rows when with_pe is off (the default).
+            mapq = int(p[11]) if with_pe else 0
+            is_primary = ("tp:A:P" in p[12:]) if with_pe else False
+            gid, side = tn.rsplit("|", 1)
+            if (side == "L" and te >= tl - SPAN_SHORTFALL) or \
+               (side == "R" and ts <= SPAN_SHORTFALL):
+                span_hits.setdefault((gid, qn), {})[side] = (strand, qs, qe, ts, te)
+            if with_pe and is_primary and mapq >= PE_MIN_MAPQ:
+                pe_hits.setdefault(qn, {})[tn] = (strand, ts, te, tl)
+            Lfl = flank_len.get(tn, tl)
+            ev = None
+            if side == "L" and abs(te - Lfl) <= LR_EDGE:
+                if strand == "+" and ql - qe >= min_clip:
+                    ev = (qn, qe, "+")
+                elif strand == "-" and qs >= min_clip:
+                    ev = (qn, qs, "-")
+            elif side == "R" and ts <= LR_EDGE:
+                if strand == "+" and qs >= min_clip:
+                    ev = (qn, qs, "+")
+                elif strand == "-" and ql - qe >= min_clip:
+                    ev = (qn, qe, "-")
+            if ev is not None:
+                # cap per (gap, side) UPFRONT: only the first max_tails tail
+                # reads per (gap, side) are kept (and thus fetched); the rest
+                # would never reach ava-pb.  Avoids fetching millions of unused
+                # tail sequences on huge inputs.
+                tside = tail_events.setdefault(gid, {"L": [], "R": []})
+                if len(tside[side]) < max_tails:
+                    tside[side].append(ev)
+                    tail_qns.add(qn)
+    spanning = {qn for (_gid, qn), h in span_hits.items()
+                if set(h) == {"L", "R"}}
+    return span_hits, pe_hits, tail_events, spanning | tail_qns
+
+
+def _sr_span_fills(span_hits: dict, flank_len: dict, seqs: dict,
+                   min_span_reads: int, max_depth_factor):
+    """Single-read span fills from pre-collected span_hits + read seqs
+    (module-level for the parallel sr path)."""
+    cands: dict = {}
+    for (gid, qn), h in span_hits.items():
+        if set(h) != {"L", "R"}:
+            continue
+        s = seqs.get(qn)
+        if s is None:
+            continue
+        strand_l, qs_l, qe_l, _tsl, te_l = h["L"]
+        strand_r, qs_r, qe_r, ts_r, _ter = h["R"]
+        if strand_l != strand_r:
+            continue
+        len_l = flank_len[f"{gid}|L"]
+        if strand_l == "+":
+            b0, b1 = qe_l + (len_l - te_l), qs_r - ts_r
+            if b1 <= b0 or b0 < 0 or b1 > len(s):
+                continue
+            seg = s[b0:b1]
+        else:
+            b0, b1 = qe_r + ts_r, qs_l - (len_l - te_l)
+            if b1 <= b0 or b0 < 0 or b1 > len(s):
+                continue
+            seg = _revcomp(s[b0:b1])
+        if "N" not in seg.upper():
+            cands.setdefault(gid, []).append(seg)
+    skip: set = set()
+    if max_depth_factor and cands:
+        depths = sorted(len(v) for v in cands.values())
+        baseline = depths[(len(depths) - 1) // 2] or 1
+        cutoff = max_depth_factor * max(baseline, min_span_reads)
+        for gid, segs in cands.items():
+            if len(segs) > cutoff:
+                skip.add(gid)
+        if skip:
+            logger.info("Span depth gate: baseline %d reads, rejecting %d "
+                        "over-collapsed gaps (>%.1fx)", baseline, len(skip),
+                        max_depth_factor)
+    out: dict = {}
+    for gid, segs in cands.items():
+        if gid in skip or len(segs) < min_span_reads:
+            continue
+        segs.sort(key=len)
+        out[gid] = segs[len(segs) // 2]
+    return out
+
+
+def _sr_stream(paf: str, fq: str, flank_len: dict, min_span_reads: int,
+               max_depth_factor, min_clip: int, max_tails: int,
+               with_pe: bool):
+    """One flank-PAF + FASTQ stream (worker entry point for the parallel sr
+    path; also used serially).  collect -> fetch usable seqs -> span fills.
+    The ~23GB span_hits lives only inside this call.  Returns
+    (span, pe_hits, tail_events, seqs) for the parent to merge."""
+    sh, pe, tev, usable = _sr_collect(paf, flank_len, min_clip, max_tails,
+                                      with_pe)
+    seqs = _fetch_read_seqs(fq, usable) if usable else {}
+    span = _sr_span_fills(sh, flank_len, seqs, min_span_reads, max_depth_factor)
+    return span, pe, tev, seqs
+
+
+def _sr_fill(paf1: str, paf2: str, reads_fq: list, flank_len: dict,
+             scaf_seqs: dict, work_prefix: str, threads: int = 4,
+             min_span_reads: int = 1, max_depth_factor: float | None = 3.0,
+             sr_insert: int = 500, min_clip: int = 30, max_tails: int = 50,
+             min_ovlp: int = 25, min_ident: float = 0.85,
+             minimap2: str = "minimap2", with_pe: bool = False,
+             parallel: bool = False):
+    """Short-read closure that scales to 100M+ reads.
+
+    Each flank PAF + its FASTQ is processed via _sr_stream (one streaming
+    pass, fetch only usable reads, span fills).  With *parallel* the two
+    PAF/FASTQ pairs run in worker processes concurrently (collect+fetch of
+    paf1/fq1 overlaps paf2/fq2); serial mode (default, used by unit tests so
+    monkeypatches stay visible) runs them in order.  Either way each PAF's
+    ~23GB span_hits is freed before the next.  Streams (no ~86GB records
+    list), caps tail reads per gap/side before fetch, skips PE by default.
+    Returns (span, overlap, pe_est).
+    """
+    PE_SHORTFALL = 300
+    args = (flank_len, min_span_reads, max_depth_factor, min_clip, max_tails,
+            with_pe)
+    if parallel:
+        with ProcessPoolExecutor(max_workers=2) as ex:
+            fut = [ex.submit(_sr_stream, paf, fq, *args)
+                   for paf, fq in ((paf1, reads_fq[0]), (paf2, reads_fq[1]))]
+            (span1, pe1, tev1, seqs1), (span2, pe2, tev2, seqs2) = \
+                [f.result() for f in fut]
+    else:
+        span1, pe1, tev1, seqs1 = _sr_stream(paf1, reads_fq[0], *args)
+        span2, pe2, tev2, seqs2 = _sr_stream(paf2, reads_fq[1], *args)
+    span = dict(span1)
+    span.update(span2)
+
+    pe_est: dict = {}
+    if with_pe:
+        est: dict = {}
+        for qn, a1 in pe1.items():
+            a2 = pe2.get(qn)
+            if not a2:
+                continue
+            for t1, (s1, ts1, te1, L1) in a1.items():
+                gid, side1 = t1.rsplit("|", 1)
+                for t2, (s2, ts2, te2, L2) in a2.items():
+                    g2, side2 = t2.rsplit("|", 1)
+                    if g2 != gid or side2 == side1:
+                        continue
+                    if side1 == "L":
+                        if not (s1 == "+" and s2 == "-"):
+                            continue
+                        short1, short2 = L1 - te1, ts2
+                    else:
+                        if not (s1 == "-" and s2 == "+"):
+                            continue
+                        short1, short2 = ts1, L2 - te2
+                    if short1 > PE_SHORTFALL or short2 > PE_SHORTFALL:
+                        continue
+                    portion1 = (te1 - ts1) + short1
+                    portion2 = (te2 - ts2) + short2
+                    gap_est = sr_insert - portion1 - portion2
+                    if gap_est > sr_insert:
+                        continue
+                    est.setdefault(gid, []).append(max(gap_est, 1))
+        for gid, sizes in est.items():
+            if len(sizes) >= 2:
+                sizes.sort()
+                pe_est[gid] = sizes[len(sizes) // 2]
+
+    tails: dict = {}
+    for tev, seqs in ((tev1, seqs1), (tev2, seqs2)):
+        for gid, sides in tev.items():
+            cur = tails.setdefault(gid, {"L": [], "R": []})
+            for side in ("L", "R"):
+                for (qn, pos, strand) in sides[side]:
+                    s = seqs.get(qn)
+                    if s is None:
+                        continue
+                    if side == "L":
+                        tail = s[pos:] if strand == "+" else _revcomp(s[:pos])
+                    else:
+                        tail = _revcomp(s[:pos]) if strand == "+" else _revcomp(s[pos:])
+                    if len(tail) < min_clip:
+                        continue
+                    if len(cur[side]) < max_tails:
+                        cur[side].append(tail)
+    ovl = overlap_closure_fills(tails, scaf_seqs, work_prefix,
+                                threads=threads, min_ovlp=min_ovlp,
+                                min_ident=min_ident, unique_check=False,
+                                minimap2=minimap2)
+    return span, ovl, pe_est
+
+
+def parse_endjoins(paf_path: str, min_reads: int = 2,
+                   max_shortfall: int = 300, abut_window: int = 30,
+                   min_trim: int = 10) -> dict:
+    """Detect end-join sites: gaps whose flanking contigs actually overlap.
+
+    For reads hitting BOTH flanks (same logic as span fills), the
+    extrapolated gap size can be <= 0: the two contigs overlap.  Returns
+    {gid: overlap_bp} where overlap_bp <= abut_window means the contigs
+    abut (join with an empty fill) and larger values mean a real overlap
+    (trim overlap_bp from the left contig end before joining, after the
+    end-sequence identity check in run_gapfill).
+    """
+    flank_len: dict[str, int] = {}
+    hits: dict[tuple, dict] = {}
+    with open(paf_path) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 12 or p[2] == "*" or p[5] == "*":
+                continue
+            gid, side = p[5].rsplit("|", 1)
+            flank_len[p[5]] = int(p[6])
+            ts, te = int(p[7]), int(p[8])
+            if side == "L":
+                if te < flank_len[p[5]] - max_shortfall:
+                    continue
+            else:
+                if ts > max_shortfall:
+                    continue
+            key = (gid, p[0])
+            h = hits.setdefault(key, {})
+            if side not in h:
+                h[side] = (p[4], int(p[2]), int(p[3]), ts, te)
+
+    ests: dict[str, list] = {}
+    for (gid, qn), h in hits.items():
+        if set(h) != {"L", "R"}:
+            continue
+        strand_l, qs_l, qe_l, _ts_l, te_l = h["L"]
+        strand_r, qs_r, qe_r, ts_r, _te_r = h["R"]
+        if strand_l != strand_r:
+            continue
+        len_l = flank_len[f"{gid}|L"]
+        if strand_l == "+":
+            est = (qs_r - ts_r) - (qe_l + (len_l - te_l))
+        else:
+            est = (qs_l - (len_l - te_l)) - (qe_r + ts_r)
+        ests.setdefault(gid, []).append(est)
+
+    out: dict[str, int] = {}
+    for gid, vals in ests.items():
+        if len(vals) < min_reads:
+            continue
+        vals.sort()
+        med = vals[len(vals) // 2]
+        if med < -abut_window and -med >= min_trim:
+            out[gid] = -med                   # overlap: trim this many bp
+        elif med <= abut_window:
+            out[gid] = 0                      # abut: empty fill
+    return out
+
+
+def _end_identity(scaf_seq: str, gb: int, ge: int, overlap: int,
+                  k: int = 15) -> float:
+    """k-mer containment of the right contig start in the left contig end
+    (fraction of right-end k-mers present in the left end)."""
+    left = scaf_seq[max(0, gb - overlap):gb]
+    right = scaf_seq[ge:ge + overlap]
+    if not left or not right:
+        return 0.0
+    kmers = {left[i:i + k] for i in range(len(left) - k + 1)}
+    n = 0
+    hit = 0
+    for i in range(len(right) - k + 1):
+        n += 1
+        if right[i:i + k] in kmers:
+            hit += 1
+    return hit / max(n, 1)
+
+
+
+def overlap_closure_fills(tails: dict, scaf_seqs: dict, work_prefix: str,
+                          threads: int = 4, min_ovlp: int = LR_MIN_OVLP,
+                          min_ident: float = LR_MIN_OVLP_IDENT,
+                          unique_check: bool = True,
+                          uniq_preset: str = "map-hifi",
+                          minimap2: str = "minimap2") -> dict:
+    """Close gaps by L x R tail overlap.
+
+    Only dovetail (L-suffix x R-prefix) overlaps are used:
+    fill = L_tail[:qe] + R_tail[te:].  With *unique_check* (default, used
+    for long reads) the overlap segment must additionally map to a unique
+    locus in the scaffolds, filtering repeat-driven pseudo-closures; the
+    uniqueness mapping uses *uniq_preset* ("splice" for cDNA tails, whose
+    sequence is not contiguous in the genome).
+    Short-read mode disables it (closure rate over correctness).
+    Returns {gid: fill_seq}.
+    """
+    records = []
+    for gid in sorted(tails):
+        for side in ("L", "R"):
+            for j, t in enumerate(tails[gid][side]):
+                records.append((f"{gid}|{side}{j}", t))
+    if not records:
+        return {}
+    tails_fa = work_prefix + ".tails.fa"
+    _write_records_fa(records, tails_fa)
+    tail_seqs = dict(records)
+
+    ava_paf = work_prefix + ".tails.ava.paf"
+    cmd = [minimap2, "-x", "ava-pb", "-t", str(threads), tails_fa, tails_fa]
+    logger.info("Running: %s", " ".join(cmd))
+    with open(ava_paf, "w") as out:
+        result = subprocess.run(cmd, stdout=out,
+                                stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        logger.warning("ava-pb failed (%s); no overlap closures",
+                       result.stderr.strip()[-500:])
+        return {}
+
+    # best dovetail overlap per gap
+    best: dict[str, tuple] = {}
+    with open(ava_paf) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 12 or p[2] == "*" or p[5] == "*":
+                continue
+            q, t = p[0], p[5]
+            gid_q, side_q = q.rsplit("|", 1)
+            gid_t, side_t = t.rsplit("|", 1)
+            if gid_q != gid_t or side_q == side_t:
+                continue
+            if not (side_q.startswith("L") and side_t.startswith("R")):
+                continue
+            qe, ts_, te = int(p[3]), int(p[7]), int(p[8])
+            ovlen = int(p[10])
+            ident = int(p[9]) / max(ovlen, 1)
+            # dovetail: overlap reaches L tail's 3' end and R tail's 5' end
+            if abs(qe - len(tail_seqs[q])) > LR_EDGE or ts_ > LR_EDGE:
+                continue
+            if ovlen < min_ovlp or ident < min_ident:
+                continue
+            if gid_q not in best or ovlen > best[gid_q][0]:
+                best[gid_q] = (ovlen, q, t, qe, ts_, te)
+
+    if not best:
+        return {}
+    if not unique_check:
+        return {gid: tail_seqs[q][:qe] + tail_seqs[t][te:]
+                for gid, (ovlen, q, t, qe, ts_, te) in best.items()}
+
+    # uniqueness of the overlap segment in the scaffolds
+    ov_fa = work_prefix + ".overlap.fa"
+    with open(ov_fa, "w") as out:
+        for gid, (ovlen, q, t, qe, ts_, te) in best.items():
+            out.write(f">{gid}\n{tail_seqs[q][qe - ovlen:qe]}\n")
+    scaf_fa = work_prefix + ".scaffolds.fa"
+    _write_records_fa(sorted(scaf_seqs.items()), scaf_fa)
+    uniq_paf = work_prefix + ".overlap.uniq.paf"
+    cmd = [minimap2, "-x", uniq_preset,
+           "-N", "100", "-t", str(threads), scaf_fa, ov_fa]
+    try:
+        with open(uniq_paf, "w") as out:
+            result = subprocess.run(cmd, stdout=out,
+                                    stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            # fall back to a widely-supported preset if the local
+            # minimap2 lacks the requested one
+            cmd[2] = "map-ont" if uniq_preset != "map-ont" else "splice"
+            with open(uniq_paf, "w") as out:
+                subprocess.run(cmd, stdout=out,
+                               stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("minimap2 not found on PATH")
+
+    # uniqueness by LOCUS (same-locus sub-alignments/secondaries don't
+    # count against; repeat overlaps land on many distinct loci)
+    loci: dict[str, set] = {}
+    with open(uniq_paf) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 12 or p[5] == "*":
+                continue
+            gid = p[0]
+            loci.setdefault(gid, set()).add((p[5], int(p[7]) // 500))
+
+    fills: dict[str, str] = {}
+    for gid, (ovlen, q, t, qe, ts_, te) in best.items():
+        n_loci = len(loci.get(gid, set()))
+        if n_loci != 1:
+            logger.debug("Overlap closure %s rejected: maps to %d loci "
+                         "(repeat overlap)", gid, n_loci)
+            continue
+        fills[gid] = tail_seqs[q][:qe] + tail_seqs[t][te:]
+    return fills
+
+
+def parse_pe_spans(paf1: str, paf2: str, insert: int = 500,
+                   max_shortfall: int = 300, min_pairs: int = 2,
+                   records1: list | None = None,
+                   records2: list | None = None) -> dict:
+    """Estimate gap sizes from paired-end spans (short-read mode).
+
+    A proper FR pair (R1 '+' on the L flank, R2 '-' on the R flank, both
+    primary, mapq >= 20, within *max_shortfall* of the gap edge) implies
+    gap size ~ insert - flank_portion_R1 - flank_portion_R2.  Per gap the
+    median over >= min_pairs pairs is returned.  NOTE: short-read PE
+    spans at repeat-rich junctions have a HIGH false-positive rate —
+    use for gap resizing only, never for sequence fills.
+
+    Returns {gid: est_size} (clamped to >= 1).
+    """
+    def load(paf, records):
+        if records is None:
+            records = _read_flank_paf(paf)
+        best: dict[str, dict] = {}   # read -> {gid|side: (strand, ts, te, tlen)}
+        for (qn, _ql, _qs, _qe, strand, tn, tl, ts, te, mapq, is_primary) in records:
+            if not is_primary or mapq < 20:
+                continue
+            best.setdefault(qn, {})[tn] = (strand, ts, te, tl)
+        return best
+
+    m1, m2 = load(paf1, records1), load(paf2, records2)
+    est: dict[str, list] = {}
+    for qn, a1 in m1.items():
+        a2 = m2.get(qn)
+        if not a2:
+            continue
+        for t1, (s1, ts1, te1, L1) in a1.items():
+            gid, side1 = t1.rsplit("|", 1)
+            for t2, (s2, ts2, te2, L2) in a2.items():
+                g2, side2 = t2.rsplit("|", 1)
+                if g2 != gid or side2 == side1:
+                    continue
+                if side1 == "L":
+                    if not (s1 == "+" and s2 == "-"):
+                        continue
+                    short1, short2 = L1 - te1, ts2
+                    portion1 = (te1 - ts1) + short1
+                    portion2 = (te2 - ts2) + short2
+                else:
+                    if not (s1 == "-" and s2 == "+"):
+                        continue
+                    short1, short2 = ts1, L2 - te2
+                    portion1 = (te1 - ts1) + short1
+                    portion2 = (te2 - ts2) + short2
+                if short1 > max_shortfall or short2 > max_shortfall:
+                    continue
+                gap_est = insert - portion1 - portion2
+                if gap_est > insert:   # inconsistent pair, skip
+                    continue
+                est.setdefault(gid, []).append(max(gap_est, 1))
+    out: dict[str, int] = {}
+    for gid, sizes in est.items():
+        if len(sizes) >= min_pairs:
+            sizes.sort()
+            out[gid] = sizes[len(sizes) // 2]
+    return out
 
 
 def parse_span_fills(paf_path: str, reads_fq, min_reads: int = 1,
@@ -572,265 +1139,6 @@ def parse_tails(paf_path: str, flank_len: dict, reads_fq,
     return tails
 
 
-def overlap_closure_fills(tails: dict, scaf_seqs: dict, work_prefix: str,
-                          threads: int = 4, min_ovlp: int = LR_MIN_OVLP,
-                          min_ident: float = LR_MIN_OVLP_IDENT,
-                          unique_check: bool = True,
-                          uniq_preset: str = "map-hifi",
-                          minimap2: str = "minimap2") -> dict:
-    """Close gaps by L x R tail overlap.
-
-    Only dovetail (L-suffix x R-prefix) overlaps are used:
-    fill = L_tail[:qe] + R_tail[te:].  With *unique_check* (default, used
-    for long reads) the overlap segment must additionally map to a unique
-    locus in the scaffolds, filtering repeat-driven pseudo-closures; the
-    uniqueness mapping uses *uniq_preset* ("splice" for cDNA tails, whose
-    sequence is not contiguous in the genome).
-    Short-read mode disables it (closure rate over correctness).
-    Returns {gid: fill_seq}.
-    """
-    records = []
-    for gid in sorted(tails):
-        for side in ("L", "R"):
-            for j, t in enumerate(tails[gid][side]):
-                records.append((f"{gid}|{side}{j}", t))
-    if not records:
-        return {}
-    tails_fa = work_prefix + ".tails.fa"
-    _write_records_fa(records, tails_fa)
-    tail_seqs = dict(records)
-
-    ava_paf = work_prefix + ".tails.ava.paf"
-    cmd = [minimap2, "-x", "ava-pb", "-t", str(threads), tails_fa, tails_fa]
-    logger.info("Running: %s", " ".join(cmd))
-    with open(ava_paf, "w") as out:
-        result = subprocess.run(cmd, stdout=out,
-                                stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        logger.warning("ava-pb failed (%s); no overlap closures",
-                       result.stderr.strip()[-500:])
-        return {}
-
-    # best dovetail overlap per gap
-    best: dict[str, tuple] = {}
-    with open(ava_paf) as f:
-        for line in f:
-            p = line.rstrip("\n").split("\t")
-            if len(p) < 12 or p[2] == "*" or p[5] == "*":
-                continue
-            q, t = p[0], p[5]
-            gid_q, side_q = q.rsplit("|", 1)
-            gid_t, side_t = t.rsplit("|", 1)
-            if gid_q != gid_t or side_q == side_t:
-                continue
-            if not (side_q.startswith("L") and side_t.startswith("R")):
-                continue
-            qe, ts_, te = int(p[3]), int(p[7]), int(p[8])
-            ovlen = int(p[10])
-            ident = int(p[9]) / max(ovlen, 1)
-            # dovetail: overlap reaches L tail's 3' end and R tail's 5' end
-            if abs(qe - len(tail_seqs[q])) > LR_EDGE or ts_ > LR_EDGE:
-                continue
-            if ovlen < min_ovlp or ident < min_ident:
-                continue
-            if gid_q not in best or ovlen > best[gid_q][0]:
-                best[gid_q] = (ovlen, q, t, qe, ts_, te)
-
-    if not best:
-        return {}
-    if not unique_check:
-        return {gid: tail_seqs[q][:qe] + tail_seqs[t][te:]
-                for gid, (ovlen, q, t, qe, ts_, te) in best.items()}
-
-    # uniqueness of the overlap segment in the scaffolds
-    ov_fa = work_prefix + ".overlap.fa"
-    with open(ov_fa, "w") as out:
-        for gid, (ovlen, q, t, qe, ts_, te) in best.items():
-            out.write(f">{gid}\n{tail_seqs[q][qe - ovlen:qe]}\n")
-    scaf_fa = work_prefix + ".scaffolds.fa"
-    _write_records_fa(sorted(scaf_seqs.items()), scaf_fa)
-    uniq_paf = work_prefix + ".overlap.uniq.paf"
-    cmd = [minimap2, "-x", uniq_preset,
-           "-N", "100", "-t", str(threads), scaf_fa, ov_fa]
-    try:
-        with open(uniq_paf, "w") as out:
-            result = subprocess.run(cmd, stdout=out,
-                                    stderr=subprocess.PIPE, text=True)
-        if result.returncode != 0:
-            # fall back to a widely-supported preset if the local
-            # minimap2 lacks the requested one
-            cmd[2] = "map-ont" if uniq_preset != "map-ont" else "splice"
-            with open(uniq_paf, "w") as out:
-                subprocess.run(cmd, stdout=out,
-                               stderr=subprocess.PIPE, text=True)
-    except FileNotFoundError:
-        raise RuntimeError("minimap2 not found on PATH")
-
-    # uniqueness by LOCUS (same-locus sub-alignments/secondaries don't
-    # count against; repeat overlaps land on many distinct loci)
-    loci: dict[str, set] = {}
-    with open(uniq_paf) as f:
-        for line in f:
-            p = line.rstrip("\n").split("\t")
-            if len(p) < 12 or p[5] == "*":
-                continue
-            gid = p[0]
-            loci.setdefault(gid, set()).add((p[5], int(p[7]) // 500))
-
-    fills: dict[str, str] = {}
-    for gid, (ovlen, q, t, qe, ts_, te) in best.items():
-        n_loci = len(loci.get(gid, set()))
-        if n_loci != 1:
-            logger.debug("Overlap closure %s rejected: maps to %d loci "
-                         "(repeat overlap)", gid, n_loci)
-            continue
-        fills[gid] = tail_seqs[q][:qe] + tail_seqs[t][te:]
-    return fills
-
-
-def parse_pe_spans(paf1: str, paf2: str, insert: int = 500,
-                   max_shortfall: int = 300, min_pairs: int = 2) -> dict:
-    """Estimate gap sizes from paired-end spans (short-read mode).
-
-    A proper FR pair (R1 '+' on the L flank, R2 '-' on the R flank, both
-    primary, mapq >= 20, within *max_shortfall* of the gap edge) implies
-    gap size ~ insert - flank_portion_R1 - flank_portion_R2.  Per gap the
-    median over >= min_pairs pairs is returned.  NOTE: short-read PE
-    spans at repeat-rich junctions have a HIGH false-positive rate —
-    use for gap resizing only, never for sequence fills.
-
-    Returns {gid: est_size} (clamped to >= 1).
-    """
-    def load(paf):
-        best: dict[str, dict] = {}   # read -> {gid|side: (strand, ts, te, tlen)}
-        with open(paf) as f:
-            for line in f:
-                p = line.rstrip("\n").split("\t")
-                if len(p) < 12 or p[2] == "*" or p[5] == "*":
-                    continue
-                if "tp:A:P" not in p[12:] or int(p[11]) < 20:
-                    continue
-                best.setdefault(p[0], {})[p[5]] = (
-                    p[4], int(p[7]), int(p[8]), int(p[6]))
-        return best
-
-    m1, m2 = load(paf1), load(paf2)
-    est: dict[str, list] = {}
-    for qn, a1 in m1.items():
-        a2 = m2.get(qn)
-        if not a2:
-            continue
-        for t1, (s1, ts1, te1, L1) in a1.items():
-            gid, side1 = t1.rsplit("|", 1)
-            for t2, (s2, ts2, te2, L2) in a2.items():
-                g2, side2 = t2.rsplit("|", 1)
-                if g2 != gid or side2 == side1:
-                    continue
-                if side1 == "L":
-                    if not (s1 == "+" and s2 == "-"):
-                        continue
-                    short1, short2 = L1 - te1, ts2
-                    portion1 = (te1 - ts1) + short1
-                    portion2 = (te2 - ts2) + short2
-                else:
-                    if not (s1 == "-" and s2 == "+"):
-                        continue
-                    short1, short2 = ts1, L2 - te2
-                    portion1 = (te1 - ts1) + short1
-                    portion2 = (te2 - ts2) + short2
-                if short1 > max_shortfall or short2 > max_shortfall:
-                    continue
-                gap_est = insert - portion1 - portion2
-                if gap_est > insert:   # inconsistent pair, skip
-                    continue
-                est.setdefault(gid, []).append(max(gap_est, 1))
-    out: dict[str, int] = {}
-    for gid, sizes in est.items():
-        if len(sizes) >= min_pairs:
-            sizes.sort()
-            out[gid] = sizes[len(sizes) // 2]
-    return out
-
-
-def parse_endjoins(paf_path: str, min_reads: int = 2,
-                   max_shortfall: int = 300, abut_window: int = 30,
-                   min_trim: int = 10) -> dict:
-    """Detect end-join sites: gaps whose flanking contigs actually overlap.
-
-    For reads hitting BOTH flanks (same logic as span fills), the
-    extrapolated gap size can be <= 0: the two contigs overlap.  Returns
-    {gid: overlap_bp} where overlap_bp <= abut_window means the contigs
-    abut (join with an empty fill) and larger values mean a real overlap
-    (trim overlap_bp from the left contig end before joining, after the
-    end-sequence identity check in run_gapfill).
-    """
-    flank_len: dict[str, int] = {}
-    hits: dict[tuple, dict] = {}
-    with open(paf_path) as f:
-        for line in f:
-            p = line.rstrip("\n").split("\t")
-            if len(p) < 12 or p[2] == "*" or p[5] == "*":
-                continue
-            gid, side = p[5].rsplit("|", 1)
-            flank_len[p[5]] = int(p[6])
-            ts, te = int(p[7]), int(p[8])
-            if side == "L":
-                if te < flank_len[p[5]] - max_shortfall:
-                    continue
-            else:
-                if ts > max_shortfall:
-                    continue
-            key = (gid, p[0])
-            h = hits.setdefault(key, {})
-            if side not in h:
-                h[side] = (p[4], int(p[2]), int(p[3]), ts, te)
-
-    ests: dict[str, list] = {}
-    for (gid, qn), h in hits.items():
-        if set(h) != {"L", "R"}:
-            continue
-        strand_l, qs_l, qe_l, _ts_l, te_l = h["L"]
-        strand_r, qs_r, qe_r, ts_r, _te_r = h["R"]
-        if strand_l != strand_r:
-            continue
-        len_l = flank_len[f"{gid}|L"]
-        if strand_l == "+":
-            est = (qs_r - ts_r) - (qe_l + (len_l - te_l))
-        else:
-            est = (qs_l - (len_l - te_l)) - (qe_r + ts_r)
-        ests.setdefault(gid, []).append(est)
-
-    out: dict[str, int] = {}
-    for gid, vals in ests.items():
-        if len(vals) < min_reads:
-            continue
-        vals.sort()
-        med = vals[len(vals) // 2]
-        if med < -abut_window and -med >= min_trim:
-            out[gid] = -med                   # overlap: trim this many bp
-        elif med <= abut_window:
-            out[gid] = 0                      # abut: empty fill
-    return out
-
-
-def _end_identity(scaf_seq: str, gb: int, ge: int, overlap: int,
-                  k: int = 15) -> float:
-    """k-mer containment of the right contig start in the left contig end
-    (fraction of right-end k-mers present in the left end)."""
-    left = scaf_seq[max(0, gb - overlap):gb]
-    right = scaf_seq[ge:ge + overlap]
-    if not left or not right:
-        return 0.0
-    kmers = {left[i:i + k] for i in range(len(left) - k + 1)}
-    n = 0
-    hit = 0
-    for i in range(len(right) - k + 1):
-        n += 1
-        if right[i:i + k] in kmers:
-            hit += 1
-    return hit / max(n, 1)
-
-
 def run_gapfill(agp_path: str, query_fasta: str, tiered_paf: str,
                 output_dir: str, reads: list,
                 method: str = "lr",
@@ -872,36 +1180,28 @@ def run_gapfill(agp_path: str, query_fasta: str, tiered_paf: str,
             raise ValueError("short-read mode requires -1 and -2 (paired-end)")
         paf1 = os.path.join(output_dir, "gapfill.flanks.r1.paf")
         paf2 = os.path.join(output_dir, "gapfill.flanks.r2.paf")
-        extra = recruit_extra or ["-N", "20"]
+        # NOTE -N is inert under -x sr: the preset implies --secondary=no, so
+        # the flank PAF is primary-only (verified on the 10x lenta PAFs: zero
+        # tp:A:S lines).  Kept for safety in case the preset ever changes or
+        # --secondary=yes is passed via recruit_extra.
+        extra = recruit_extra or ["-N", "5"]
         run_minimap2(flanks_fa, [reads[0]], paf1, "sr", threads=threads,
                      extra=extra, minimap2=minimap2)
         run_minimap2(flanks_fa, [reads[1]], paf2, "sr", threads=threads,
                      extra=extra, minimap2=minimap2)
-        span = parse_span_fills(paf1, [reads[0]], min_reads=min_span_reads,
-                                max_depth_factor=max_depth_factor)
-        span2 = parse_span_fills(paf2, [reads[1]], min_reads=min_span_reads,
-                                 max_depth_factor=max_depth_factor)
-        for gid, seq in span2.items():
-            span.setdefault(gid, seq)
+        # sr closure via _sr_fill: streams each flank PAF once, fetches ONLY
+        # usable read sequences (spanning + tail-bearing) in one FASTQ pass
+        # per file.  Old path fetched every flank-hitting read and re-scanned
+        # each FASTQ 4x -> the 10x (325M-read) hang.
+        prefix = os.path.join(output_dir, "gapfill")
+        span, ovl, pe_est = _sr_fill(
+            paf1, paf2, [reads[0], reads[1]], flank_len, scaf_seqs, prefix,
+            threads=threads, min_span_reads=min_span_reads,
+            max_depth_factor=max_depth_factor, sr_insert=sr_insert,
+            minimap2=minimap2, parallel=True)
         logger.info("Single-read span closures: %d gaps", len(span))
-        pe_est = parse_pe_spans(paf1, paf2, insert=sr_insert)
         logger.info("PE-span size estimates (>=2 pairs): %d gaps "
                     "(CAUTION: high FP rate at repeat junctions)", len(pe_est))
-        # SR tail-overlap closure: merge mate tails; dovetail merge gives
-        # full gap sequence for gaps up to ~2x read length.  Uniqueness
-        # check disabled — closure rate over correctness (documented).
-        tails: dict = {}
-        for pafi, fqi in ((paf1, reads[0]), (paf2, reads[1])):
-            for gid, sides in parse_tails(pafi, flank_len, [fqi],
-                                          min_clip=30, max_tails=50).items():
-                cur = tails.setdefault(gid, {"L": [], "R": []})
-                for side in ("L", "R"):
-                    cur[side].extend(sides[side])
-        prefix = os.path.join(output_dir, "gapfill")
-        ovl = overlap_closure_fills(tails, scaf_seqs, prefix,
-                                    threads=threads, min_ovlp=25,
-                                    min_ident=0.85, unique_check=False,
-                                    minimap2=minimap2)
         logger.info("Tail-overlap closures (no uniqueness filter, "
                     "CAUTION: high FP rate): %d gaps", len(ovl))
     else:
