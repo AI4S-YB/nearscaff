@@ -29,13 +29,21 @@ module (`kmer-phase`) is included (see below).
   secondary alignments so a contig whose primary hit lies far from every
   scaffold can still extend one via a secondary hit. A maximum-weight
   matching (Edmonds' Blossom for small graphs, a greedy heuristic above
-  20 000 edges) resolves contig adjacency. Scaffolds are merged per
-  chromosome; the final precise pass reuses per-contig alignments cached
-  during Stage 0 and the extension passes (only contigs without a cached
-  hit are re-aligned, with `--secondary=no`), and components are ordered
-  by reference midpoint and oriented by alignment strand (orientations
-  supported only by low-mapping-quality alignments are reported as `?`).
-  Scaffolds are written as AGP, then converted to FASTA.
+  20 000 edges) resolves contig adjacency. Before same-chromosome
+  scaffolds are merged, cross-chromosome bridge edges are cut
+  (chromosome-purity enforcement: a graph component may span at most one
+  *significant* chromosome — ≥ 20% length share and ≥ 1 Mb — which
+  prevents chimeric, nested scaffolds when homeologous chromosomes
+  attract spurious edges). Components are ordered by reference midpoint
+  and then re-ordered for synteny consistency against the protein
+  anchors (the anchor coordinate wins over the nucleotide midpoint;
+  per-scaffold relocations and suspect contigs are reported in
+  `synteny_order_report.tsv`). The final precise pass reuses per-contig
+  alignments cached during Stage 0 and the extension passes (only
+  contigs without a cached hit are re-aligned, with `--secondary=no`),
+  components are oriented by alignment strand (orientations supported
+  only by low-mapping-quality alignments are reported as `?`), and
+  scaffolds are written as AGP, then converted to FASTA.
 
 ## Requirements
 
@@ -77,6 +85,12 @@ GFF3 annotation. Useful options:
   with MINLEN keep only contigs ≥ MINLEN bp). Hyper-fragmented queries
   can otherwise lose a sizable fraction of the assembly from the output,
   silently hurting downstream completeness metrics
+- `--no-chr-purity` — do not cut cross-chromosome bridge edges before
+  the per-chromosome scaffold merge (on by default; thresholds
+  `--min-chr-share` 0.20 and `--min-chr-len` 1000000)
+- `--no-synteny-reorder` — do not re-order contigs within scaffolds for
+  protein-anchor synteny consistency (on by default; suspect thresholds
+  `--suspect-anchor-span` 5000000 and `--suspect-divergence` 10000000)
 - `--nucleotide-passes asm5 asm20` — nucleotide extension passes
   (default `asm5 asm20`; pass `asm5 asm10 asm20` for the pre-0.3.1
   behavior)
@@ -530,6 +544,20 @@ New subcommands and output-completeness/correctness features over 0.3.1:
   scaffold graph are appended to the AGP as singleton scaffolds named
   after the contig (default: off) — hyper-fragmented queries otherwise
   lose a sizable fraction of the assembly from the output.
+- **Chromosome-purity enforcement (Stage 1c, on by default).**
+  Cross-chromosome bridge edges in the scaffold graph are cut before
+  same-chromosome scaffolds are merged — found as chimeric, nested
+  chromosomes when scaffolding a real plant genome; after the fix every
+  scaffold spans at most one significant chromosome (≥ 20% length share
+  and ≥ 1 Mb; `--no-chr-purity`, `--min-chr-share`, `--min-chr-len`).
+- **Synteny-consistent contig reorder (Stage 1e, on by default).**
+  Contigs within each scaffold are re-ordered against the protein-anchor
+  synteny (anchor coordinate wins over the nucleotide midpoint; keyed on
+  the anchor's own chromosome space so cross-species anchor sets work).
+  Per-scaffold relocations and suspect contigs go to
+  `synteny_order_report.tsv`; verified with jcvi dotplots against the
+  reference (`--no-synteny-reorder`, `--suspect-anchor-span`,
+  `--suspect-divergence`).
 
 Validated on a hyper-fragmented real plant assembly (~200 Mb, 281k
 contigs, re-scaffolded against a chromosome-level reference of the same

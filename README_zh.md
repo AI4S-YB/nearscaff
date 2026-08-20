@@ -21,11 +21,16 @@
   自动重建）做一次全参考比对，并保留至多 `-N 5` 个次级比对——主比对
   离所有 scaffold 都远的 contig 也可以通过次级比对挂到 scaffold 末端。
   contig 邻接关系由最大权匹配确定（小图用 Edmonds Blossom 精确算法，
-  边数超过 20,000 时切换为贪心启发式）。scaffold 按染色体合并后，
-  最终精修直接复用 Stage 0 和扩展轮缓存的逐 contig 比对（只对无缓存的
-  contig 重新比对，且用 `--secondary=no`），按参考基因组中点坐标
-  排序、按比对链向定向（仅由低 mapq 比对支持的方向标记为 `?`），
-  最后写出 AGP 并转换为 FASTA。
+  边数超过 20,000 时切换为贪心启发式）。按染色体合并 scaffold 之前，
+  先切断跨染色体的桥边（染色体纯度强制：一个图分量最多跨一条
+  「显著」染色体——长度占比 ≥20% 且 ≥1 Mb——防止同源染色体间的
+  虚假边把染色体嵌套成嵌合 scaffold）。组件先按参考中点坐标排序，
+  再对蛋白锚点的共线性做一致性重排（锚点坐标优先于核酸中点；各
+  scaffold 的重排数和可疑 contig 写入 `synteny_order_report.tsv`）。
+  scaffold 按染色体合并后，最终精修直接复用 Stage 0 和扩展轮缓存的
+  逐 contig 比对（只对无缓存的 contig 重新比对，且用
+  `--secondary=no`），按比对链向定向（仅由低 mapq 比对支持的方向
+  标记为 `?`），最后写出 AGP 并转换为 FASTA。
 
 ## 依赖
 
@@ -65,6 +70,11 @@ nearscaff run -r REF.fa -p PROTEINS.pep -q QUERY.fa -o OUT -t 16 --preset near
   以原名 singleton 行追加进 AGP（默认关闭；带 MINLEN 时只保留
   ≥MINLEN bp 的）。高度碎片化的 query 若不开启，相当比例的组装
   序列会从输出中丢失，悄悄拉低下游完整性指标
+- `--no-chr-purity` —— 不按染色体合并前切断跨染色体桥边（默认
+  开启；阈值 `--min-chr-share` 0.20、`--min-chr-len` 1000000）
+- `--no-synteny-reorder` —— 不对 scaffold 内 contig 做蛋白锚点
+  共线性一致性重排（默认开启；可疑阈值 `--suspect-anchor-span`
+  5000000、`--suspect-divergence` 10000000）
 - `--nucleotide-passes asm5 asm20` —— 核苷酸扩展轮次（默认
   `asm5 asm20`；传入 `asm5 asm10 asm20` 可还原 0.3.1 之前的行为）
 - `--secondary-alignments INT` —— 扩展轮保留的 minimap2 `-N` 次级
@@ -464,6 +474,18 @@ contig 准确率高，说明分错的主要是短 contig：案例 A 中基因组
 - **`--keep-unplaced [MINLEN]`。** 从未进图的 query contig 以原名
   singleton 追加进 AGP（默认关闭）——高度碎片化的 query 否则会
   从输出中丢失相当比例的组装序列。
+- **染色体纯度强制（Stage 1c，默认开启）。** 按染色体合并
+  scaffold 之前切断图上的跨染色体桥边——在一个实测植物基因组上
+  曾出现染色体嵌套/嵌合，修复后每条 scaffold 最多跨一条显著
+  染色体（长度占比 ≥20% 且 ≥1 Mb；`--no-chr-purity`、
+  `--min-chr-share`、`--min-chr-len`）。
+- **共线性一致的 contig 重排（Stage 1e，默认开启）。** scaffold
+  内 contig 对蛋白锚点共线性做一致性重排（锚点坐标优先于核酸
+  中点；按锚点自身的染色体空间判定，跨物种锚点集也可用）。
+  各 scaffold 的重排数与可疑 contig 写入
+  `synteny_order_report.tsv`；用 jcvi 点图对参考验证通过
+  （`--no-synteny-reorder`、`--suspect-anchor-span`、
+  `--suspect-divergence`）。
 
 在一个高度碎片化的实测植物基因组上验证（~200 Mb、28 万条
 contig，用同种的染色体级参考重挂载）：95–96% 的短填充和约 95% 的
