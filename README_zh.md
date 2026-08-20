@@ -226,6 +226,38 @@ overlap 闭合与内含子跳过分类的统计报告。
 > 真实内含子序列的分析。只动确定是外显子的 gap 时用
 > `--fill-mode exon-only`。
 
+## 资源消耗（gapfill / rna-fill）
+
+在本仓库的真实数据集上实测（16–24 线程；墙钟时间 / 有记录的峰值
+内存）。
+
+**gapfill（DNA fill）短读模式，16 线程**——两个植物组装（lenta
+16,649 gaps / nana，碎片化）：
+
+| 步骤 | 时间 | 峰值内存 |
+|---|---|---|
+| minibwa index（200 Mb scaffold） | 32 s | 2.0 GB |
+| minibwa map 16.7M 短 reads | 85 s | 1.4 GB |
+| minimap2 map-hifi 1.3M reads（全基因组） | 266 s | 1.4 GB |
+| minimap2 vs flank 迷你参考（HiFi） | 194 s | 0.95 GB |
+| minimap2 `-x sr` 16.7M reads vs flank 迷你参考 | 35 s | 0.26 GB |
+| **SR 模式全程（lenta / nana）** | **105 / 190 min** | ≤6 GB（bloom） |
+
+**rna-fill，24 线程**——我们实测的最大规模（petraea：281k contig
+组装、290,735 个 gap、2.5 万条转录本、120–190 Mb 参考，
+`--ref` 放置 + fill-check）：
+
+| 步骤 | 时间 |
+|---|---|
+| minimap2 转录本 → flank 迷你参考 | 28 s |
+| span/overlap 闭合 + 单侧延伸 | ~35 s |
+| miniprot 参考基因推导 + intact 过滤 | ~65 s |
+| minimap2 转录本 → 参考基因组（`--ref`） | 152 s |
+| **rna-fill 全程** | **~5 min** |
+
+rna-fill 峰值内存由 minimap2 主导（约 200 Mb 参考 ≈1–2 GB）；常规
+规模（数万个 gap）在 16–24 线程下几分钟即可完成。
+
 ## 输出
 
 输出目录中的文件：
@@ -423,7 +455,8 @@ contig 准确率高，说明分错的主要是短 contig：案例 A 中基因组
 染色体级 ALyr 参考重挂载）：95–96% 的短填充和约 95% 的放置基因
 内含子落在参考正确位置；fill-check 驳回 27.5% 的长填充（多为旁系
 污染），填充/参考位点一致率从 82.6% 提升到 91.5%；最终 BUSCO
-C:99.3%（genome）、C:95.2%（蛋白）。
+C:99.3%（genome）、C:95.2%（蛋白）。两个填充工具的实测耗时/内存见
+上文新增的「资源消耗」一节。
 
 ### 0.3.1
 

@@ -263,6 +263,39 @@ span / abut / overlap closures and intronic skips.
 > analyses that need true intronic sequence. Use `--fill-mode
 > exon-only` when only certainly-exonic gaps should be touched.
 
+## Resource usage (gapfill / rna-fill)
+
+Measured on the real-world datasets in this repository (16–24 threads;
+wall time / peak memory where recorded).
+
+**gapfill (DNA fill), short-read mode, 16 threads** — two plant
+assemblies (lenta 16,649 gaps / nana, fragmented):
+
+| step | time | peak RSS |
+|---|---|---|
+| minibwa index (200 Mb scaffolds) | 32 s | 2.0 GB |
+| minibwa map 16.7M short reads | 85 s | 1.4 GB |
+| minimap2 map-hifi 1.3M reads (whole genome) | 266 s | 1.4 GB |
+| minimap2 vs flank mini-reference (HiFi) | 194 s | 0.95 GB |
+| minimap2 `-x sr` 16.7M reads vs flank mini-reference | 35 s | 0.26 GB |
+| **full SR-mode run (lenta / nana)** | **105 / 190 min** | ≤6 GB (bloom) |
+
+**rna-fill, 24 threads** — worst case in our campaigns (petraea:
+290,735 gaps from a 281k-contig assembly, 25k transcripts, 120–190 Mb
+reference, `--ref` placement + fill-check):
+
+| step | time |
+|---|---|
+| minimap2 transcripts → flank mini-reference | 28 s |
+| span/overlap closures + one-sided extensions | ~35 s |
+| miniprot ref-gene derivation + intact filter | ~65 s |
+| minimap2 transcripts → reference (`--ref`) | 152 s |
+| **total rna-fill** | **~5 min** |
+
+rna-fill peak memory is dominated by minimap2 (≈1–2 GB for a ~200 Mb
+reference); typical lines (tens of thousands of gaps) finish in a few
+minutes on 16–24 threads.
+
 ## Outputs
 
 Written to the output directory:
@@ -486,6 +519,8 @@ short fills and ~95% of placed-gene introns land at the correct
 reference locus; the fill-check rejects 27.5% of long fills (mostly
 paralogs) and lifts fill/reference locus concordance from 82.6% to
 91.5%, with final BUSCO C:99.3% (genome) and C:95.2% (proteins).
+Measured wall-time / memory for both fill tools is in the new
+*Resource usage* section above.
 
 ### 0.3.1
 
