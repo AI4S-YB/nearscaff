@@ -470,7 +470,10 @@ contig 准确率高，说明分错的主要是短 contig：案例 A 中基因组
   span/延伸填充会对参考做校验：最优命中落在 gap 参考括号之外
   （±50 kb）的判为疑似旁系污染并驳回，gap 回落给放置机制
   （`--no-fill-check` 关闭）。
-- **`gapfill`：长读 gap 闭合**（`--method sr/lr/endjoin`）。
+- **`gapfill`：长读 gap 闭合**（`--method sr/lr/endjoin`）。sr 路径
+  可扩展到 10x 二代数据：flank PAF 单遍解析 + awk 预过滤、按 mate
+  流式闭合并只取可用 reads、外部 `gzip -dc` 解压、尾巴 reads 限量
+  预取——10x 数据集上 >3.5 小时的卡死降至约 36 分钟。
 - **`--keep-unplaced [MINLEN]`。** 从未进图的 query contig 以原名
   singleton 追加进 AGP（默认关闭）——高度碎片化的 query 否则会
   从输出中丢失相当比例的组装序列。

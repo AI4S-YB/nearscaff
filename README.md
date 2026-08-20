@@ -540,6 +540,10 @@ New subcommands and output-completeness/correctness features over 0.3.1:
   likely paralog contamination and falls through to placement
   (`--no-fill-check` disables).
 - **`gapfill` — long-read gap closing** (`--method sr/lr/endjoin`).
+  The sr path scales to 10x short-read datasets: single-pass flank-PAF
+  parsing with an awk prefilter, streaming per-mate closure fetching
+  only usable reads, external `gzip -dc`, and tail-read capping — a
+  >3.5 h hang is now ~36 min on a 10x dataset.
 - **`--keep-unplaced [MINLEN]`.** Query contigs that never enter the
   scaffold graph are appended to the AGP as singleton scaffolds named
   after the contig (default: off) — hyper-fragmented queries otherwise
