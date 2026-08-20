@@ -422,7 +422,7 @@ import pytest  # noqa: E402
 from nearscaff.rnafill import (  # noqa: E402
     read_ref_genes, contig_ref_index, gap_ref_brackets,
     assign_tx_to_genes, build_gene_placement, plan_placements,
-    run_rnafill)
+    run_rnafill, _hit_in_bracket, _ref_check_fills)
 
 HAS_MINIMAP2 = shutil.which("minimap2") is not None
 
@@ -744,3 +744,84 @@ def test_find_intact_proteins(tmp_path):
     ]) + "\n")
     assert find_intact_proteins(trans) == {"P1", "P4"}
     assert find_intact_proteins(trans, min_cov=0.4) == {"P1", "P3", "P4"}
+
+
+def _two_gap_agp():
+    return AGPReader().parse(
+        "s1\t1\t5000\t1\tW\tcA\t1\t5000\t+\n"
+        "s1\t5001\t5100\t2\tU\t100\tscaffold\tyes\tna\n"
+        "s1\t5101\t10100\t3\tW\tcB\t1\t5000\t+\n"
+        "s1\t10101\t10200\t4\tU\t100\tscaffold\tyes\tna\n"
+        "s1\t10201\t15200\t5\tW\tcC\t1\t5000\t+\n")
+
+
+def _two_gap_tiered(tmp_path):
+    # cA -> chrR [10000,15000), cB -> [15700,20700), cC -> [20700,25700)
+    return _tiered_paf(tmp_path, [
+        "cA\t5000\t0\t5000\t+\tchrR\t30000\t10000\t15000\t5000\t5000\t60"
+        "\ttp:A:P",
+        "cB\t5000\t0\t5000\t+\tchrR\t30000\t15700\t20700\t5000\t5000\t60"
+        "\ttp:A:P",
+        "cC\t5000\t0\t5000\t+\tchrR\t30000\t20700\t25700\t5000\t5000\t60"
+        "\ttp:A:P",
+    ])
+
+
+def test_hit_in_bracket():
+    br = ("chrR", 10000, 20000, False)
+    hit = ["q", "1000", "0", "1000", "+", "chrR", "30000", "14900",
+           "15100", "200", "200", "60"]
+    assert _hit_in_bracket(hit, br, 100)
+    far = hit.copy()
+    far[7], far[8] = "25000", "26000"
+    assert not _hit_in_bracket(far, br, 100)
+    assert _hit_in_bracket(far, br, 6000)      # within slack
+    wrong_chr = hit.copy()
+    wrong_chr[5] = "chrX"
+    assert not _hit_in_bracket(wrong_chr, br, 100)
+
+
+def test_ref_check_fills(tmp_path):
+    """fill-check: fills mapping outside the ref bracket are rejected;
+    short fills and on-bracket fills are kept; ext sides independent."""
+    agp_lines = _two_gap_agp()
+    tiered = _two_gap_tiered(tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    # gap idx 1 -> bracket chrR:14999-15700; gap idx 3 -> chrR:20699-25000
+    (out / "rnafill.fillcheck.paf").write_text(
+        # fill on gap 1 maps inside its bracket -> kept
+        "f1\t800\t0\t800\t+\tchrR\t30000\t15000\t15800\t800\t800\t60\n"
+        # ext L on gap 3 maps to another chr -> side rejected
+        "e3L\t700\t0\t700\t+\tchrX\t30000\t1000\t1700\t700\t700\t60\n"
+        # ext R on gap 3 maps inside -> kept
+        "e3R\t600\t0\t600\t+\tchrR\t30000\t21000\t21600\t600\t600\t60\n")
+    fills_idx = {1: "A" * 800}
+    ext_idx = {3: ("C" * 700, "G" * 600)}
+    detail = {"s1:5001-5100": ("span", "tx1", 800),
+              "s1:10101-10200": ("ext_LR", "tx2", 1300)}
+    f2, e2, d2 = _ref_check_fills(fills_idx, ext_idx, detail, agp_lines,
+                                  str(tiered), "ref.fa", str(out),
+                                  "splice:hq", 1, "minimap2")
+    assert f2 == {1: "A" * 800}
+    assert e2 == {3: (None, "G" * 600)}     # only the L side rejected
+    assert d2 == detail                      # gap still extended -> kept
+
+    # a span fill mapping outside its bracket is rejected and the gap
+    # detail dropped (falls through to placement)
+    (out / "rnafill.fillcheck.paf").write_text(
+        "f1\t800\t0\t800\t+\tchrX\t30000\t1000\t1800\t800\t800\t60\n")
+    fills_idx = {1: "A" * 800}
+    detail = {"s1:5001-5100": ("span", "tx1", 800)}
+    f3, e3, d3 = _ref_check_fills(fills_idx, {}, detail, agp_lines,
+                                  str(tiered), "ref.fa", str(out),
+                                  "splice:hq", 1, "minimap2")
+    assert f3 == {} and d3 == {}
+
+    # short fills are not validated (kept even if off-locus)
+    (out / "rnafill.fillcheck.paf").write_text("")
+    fills_idx = {1: "A" * 300}
+    f4, _e, _d = _ref_check_fills(fills_idx, {}, {}, agp_lines,
+                                  str(tiered), "ref.fa", str(out),
+                                  "splice:hq", 1, "minimap2")
+    assert f4 == {1: "A" * 300}

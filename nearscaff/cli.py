@@ -276,6 +276,12 @@ def main():
                       "intron/intergenic spacer lengths at this size "
                       "(default: 50000; shorter caps help miniprot span "
                       "the placeholder N)")
+    p_rf.add_argument("--no-fill-check", action="store_true",
+                      help="With --ref: do NOT validate span/extension "
+                      "fills against the reference (default: fills >=500 "
+                      "bp whose best hit lands outside the gap's ref "
+                      "bracket are rejected as likely paralog "
+                      "contamination and fall through to placement)")
 
     args = parser.parse_args()
 
@@ -544,7 +550,8 @@ def _cmd_rnafill(args):
             place_max_genes=args.place_max_genes,
             place_min_ovlp=args.place_min_ovlp,
             place_intact_cov=args.place_intact_cov,
-            place_max_spacer=args.place_max_spacer)
+            place_max_spacer=args.place_max_spacer,
+            fill_check=not args.no_fill_check)
     except (ValueError, RuntimeError) as e:
         logging.getLogger("nearscaff").error("rna-fill failed: %s", e)
         sys.exit(1)

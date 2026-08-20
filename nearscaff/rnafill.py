@@ -92,6 +92,102 @@ PLACE_MAX_SPACER = 50000  # ... capped (ref distances are only estimates)
 PLACE_MIN_EDGE = 50     # bracket-edge/intergenic spacers: min length
 PLACE_MAX_BRACKET = 1_000_000
 PLACE_MAX_GENES = 50
+FILL_CHECK_MIN_LEN = 500    # only fills this long get the ref bracket check
+FILL_CHECK_MARGIN = 50000   # bracket slack for the validation hit
+
+
+def _hit_in_bracket(paf_fields, bracket, margin):
+    """True if a PAF hit overlaps the gap's reference bracket (±margin)."""
+    chr_, r0, r1, _flip = bracket
+    return paf_fields[5] == chr_ and \
+        int(paf_fields[8]) >= r0 - margin and \
+        int(paf_fields[7]) <= r1 + margin
+
+
+def _ref_check_fills(fills_idx, ext_idx, detail, agp_lines, tiered_paf,
+                     ref, output_dir, tx_preset, threads, minimap2):
+    """Reject span/extension fills that map outside their ref bracket.
+
+    Long flank-recruited fills are validated against the reference: a
+    fill whose best minimap2 hit lands outside the gap's flank bracket
+    (±FILL_CHECK_MARGIN) is likely paralog contamination and is dropped
+    (the gap falls through to ref-guided placement).  Fills shorter
+    than FILL_CHECK_MIN_LEN, fills on un-bracketable gaps, and fills
+    that simply do not map (possibly query-specific novel sequence) are
+    kept.  Returns (fills_idx, ext_idx, detail) with rejections removed.
+    """
+    idx_to_gid = {i: f"{l.object_name}:{l.object_beg}-{l.object_end}"
+                  for i, l in enumerate(agp_lines)
+                  if isinstance(l, AGPGapLine)}
+    cidx = contig_ref_index(tiered_paf)
+    cand = set(fills_idx) | set(ext_idx)
+    brackets = gap_ref_brackets(agp_lines, cand, cidx)
+    records = []        # (rec_id, seq)
+    rec_map = {}        # rec_id -> ("fill"|"extL"|"extR", agp_idx)
+    for i in sorted(cand):
+        if i not in brackets:
+            continue
+        if i in fills_idx:
+            seq = fills_idx[i]
+            if seq and len(seq) >= FILL_CHECK_MIN_LEN:
+                rid = f"f{i}"
+                records.append((rid, seq))
+                rec_map[rid] = ("fill", i)
+        if i in ext_idx:
+            lseq, rseq = ext_idx[i]
+            for tag, s in (("L", lseq), ("R", rseq)):
+                if s and len(s) >= FILL_CHECK_MIN_LEN:
+                    rid = f"e{i}{tag}"
+                    records.append((rid, s))
+                    rec_map[rid] = ("ext" + tag, i)
+    if not records:
+        return fills_idx, ext_idx, detail
+    fa = os.path.join(output_dir, "rnafill.fillcheck.fa")
+    _write_records_fa(records, fa)
+    paf = os.path.join(output_dir, "rnafill.fillcheck.paf")
+    if not os.path.exists(paf):
+        run_minimap2(ref, [fa], paf, tx_preset, threads=threads,
+                     extra=["--secondary=no"], minimap2=minimap2)
+    best: dict = {}
+    with open(paf) as fh:
+        for line in fh:
+            p = line.rstrip("\n").split("\t")
+            if len(p) < 12:
+                continue
+            span = int(p[3]) - int(p[2])
+            if p[0] not in best or \
+                    span > int(best[p[0]][3]) - int(best[p[0]][2]):
+                best[p[0]] = p
+    rej_fill: set = set()
+    rej_side: dict = {}     # agp_idx -> set of failing sides ("L"/"R")
+    for rid, p in best.items():
+        kind, i = rec_map[rid]
+        if _hit_in_bracket(p, brackets[i], FILL_CHECK_MARGIN):
+            continue
+        if kind == "fill":
+            rej_fill.add(i)
+        else:
+            rej_side.setdefault(i, set()).add(kind[3])
+    for i in rej_fill:
+        fills_idx.pop(i, None)
+        detail.pop(idx_to_gid[i], None)
+    for i, sides in rej_side.items():
+        lseq, rseq = ext_idx[i]
+        if "L" in sides:
+            lseq = None
+        if "R" in sides:
+            rseq = None
+        if lseq or rseq:
+            ext_idx[i] = (lseq, rseq)
+        else:
+            ext_idx.pop(i, None)
+            detail.pop(idx_to_gid[i], None)
+    if rej_fill or rej_side:
+        logger.info("Ref fill-check: rejected %d span fills and %d "
+                    "extension sides mapping outside their ref bracket "
+                    "(%d fills validated)", len(rej_fill),
+                    sum(len(v) for v in rej_side.values()), len(records))
+    return fills_idx, ext_idx, detail
 PLACE_MIN_OVLP = 0.5
 PLACE_INTACT_COV = 0.8  # proteins with an intact query hit (cov >= this,
                         # no X) are not placed again (anti-duplication)
@@ -997,7 +1093,8 @@ def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
                 place_max_genes: int = PLACE_MAX_GENES,
                 place_min_ovlp: float = PLACE_MIN_OVLP,
                 place_intact_cov: float = PLACE_INTACT_COV,
-                place_max_spacer: int = PLACE_MAX_SPACER) -> dict:
+                place_max_spacer: int = PLACE_MAX_SPACER,
+                fill_check: bool = True) -> dict:
     """Transcript-guided filling of genic gaps via flank recruitment.
 
     *transcripts* is a list of FASTA/FASTQ(.gz) files (Iso-Seq, ONT cDNA
@@ -1133,6 +1230,10 @@ def run_rnafill(agp_path: str, query_fasta: str, tiered_paf: str,
     place_idx: dict = {}
     placed_rows: list = []
     if ref:
+        if fill_check:
+            fills_idx, ext_idx, detail = _ref_check_fills(
+                fills_idx, ext_idx, detail, agp_lines, tiered_paf, ref,
+                output_dir, tx_preset, threads, minimap2)
         remaining = set(eligible) - set(fills_idx) - set(ext_idx)
         cidx = contig_ref_index(tiered_paf)
         brackets = gap_ref_brackets(agp_lines, remaining, cidx,

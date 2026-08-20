@@ -206,7 +206,10 @@ N，HiFi 组装没有，默认 0 关闭）；`--ref REF.fa` + `--ref-gff GFF3` /
 默认 0.5；`--place-intact-cov` 默认 0.8——蛋白在 query 中已有
 完整命中（无 X）的参考基因不重复放置，防旁系/挂载错位造重复；
 `--place-max-spacer` 默认 50000，截断参考估计的内含子/基因间 N
-占位长度）。需要 `PATH` 上有 `minimap2`。
+占位长度）。有 `--ref` 时，长的 span/延伸填充还会对参考做校验：
+≥500 bp 的填充若最优命中落在其 gap 的参考括号之外，判为疑似旁系
+污染并驳回（该 gap 回落给放置机制；可用 `--no-fill-check` 关闭）。
+需要 `PATH` 上有 `minimap2`。
 
 输出：`nearscaff.rnafill.agp` 和 `nearscaff.rnafill.scaffolds.fa`
 （填充 component 命名为 `*_gapfill_tx*`），另有按 span / abut /
