@@ -451,7 +451,9 @@ output is flagged or withheld rather than reported confidently.
 
 ## Changelog
 
-### Unreleased
+### 0.3.2
+
+New subcommands and output-completeness/correctness features over 0.3.1:
 
 - **`rna-fill` — transcript-guided filling of genic gaps.** Short-read
   or assembled transcripts are recruited by the gap flanks; span
@@ -477,6 +479,13 @@ output is flagged or withheld rather than reported confidently.
   scaffold graph are appended to the AGP as singleton scaffolds named
   after the contig (default: off) — hyper-fragmented queries otherwise
   lose a sizable fraction of the assembly from the output.
+
+Validated on a hyper-fragmented real assembly (A. lyrata, 281k contigs,
+re-scaffolded against the chromosome-level ALyr reference): 95–96% of
+short fills and ~95% of placed-gene introns land at the correct
+reference locus; the fill-check rejects 27.5% of long fills (mostly
+paralogs) and lifts fill/reference locus concordance from 82.6% to
+91.5%, with final BUSCO C:99.3% (genome) and C:95.2% (proteins).
 
 ### 0.3.1
 
