@@ -269,8 +269,8 @@ Measured on the real-world datasets in this repository (16–24 threads;
 wall time / peak memory where recorded).
 
 **gapfill (DNA fill), short-read mode, 16 threads** — two plant
-assemblies (a plant genome with 16,649 gaps and a fragmented plant
-genome):
+assemblies (a ~460 Mb plant genome, 16,649 gaps; a fragmented
+~560 Mb plant genome, ~550k contigs):
 
 | step | time | peak RSS |
 |---|---|---|
@@ -282,9 +282,9 @@ genome):
 | **full SR-mode run (two plant assemblies)** | **105 / 190 min** | ≤6 GB (bloom) |
 
 **rna-fill, 24 threads** — worst case in our campaigns (a
-hyper-fragmented plant assembly: 290,735 gaps from a 281k-contig
-assembly, 25k transcripts, 120–190 Mb reference, `--ref` placement +
-fill-check):
+hyper-fragmented ~200 Mb plant assembly: 290,735 gaps from a
+281k-contig assembly, 25k transcripts, 120–190 Mb reference, `--ref`
+placement + fill-check):
 
 | step | time |
 |---|---|
@@ -515,8 +515,8 @@ New subcommands and output-completeness/correctness features over 0.3.1:
   after the contig (default: off) — hyper-fragmented queries otherwise
   lose a sizable fraction of the assembly from the output.
 
-Validated on a hyper-fragmented real plant assembly (281k contigs,
-re-scaffolded against a chromosome-level reference of the same
+Validated on a hyper-fragmented real plant assembly (~200 Mb, 281k
+contigs, re-scaffolded against a chromosome-level reference of the same
 species): 95–96% of
 short fills and ~95% of placed-gene introns land at the correct
 reference locus; the fill-check rejects 27.5% of long fills (mostly
